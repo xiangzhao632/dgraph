@@ -35,21 +35,22 @@ import (
 // The range 0x80 - 0xff is for custom tokenizers.
 // TODO: use these everywhere where we must ensure a system tokenizer.
 const (
-	IdentNone     = 0x0
-	IdentTerm     = 0x1
-	IdentExact    = 0x2
-	IdentYear     = 0x4
-	IdentMonth    = 0x41
-	IdentDay      = 0x42
-	IdentHour     = 0x43
-	IdentGeo      = 0x5
-	IdentInt      = 0x6
-	IdentFloat    = 0x7
-	IdentFullText = 0x8
-	IdentBool     = 0x9
-	IdentTrigram  = 0xA
-	IdentHash     = 0xB
-	IdentCustom   = 0x80
+	IdentNone      = 0x0
+	IdentTerm      = 0x1
+	IdentExact     = 0x21
+	IdentExactLang = 0x22
+	IdentYear      = 0x4
+	IdentMonth     = 0x41
+	IdentDay       = 0x42
+	IdentHour      = 0x43
+	IdentGeo       = 0x5
+	IdentInt       = 0x6
+	IdentFloat     = 0x7
+	IdentFullText  = 0x8
+	IdentBool      = 0x9
+	IdentTrigram   = 0xA
+	IdentHash      = 0xB
+	IdentCustom    = 0x80
 )
 
 // Tokenizer defines what a tokenizer must provide.
@@ -289,17 +290,30 @@ func (t TermTokenizer) IsSortable() bool { return false }
 func (t TermTokenizer) IsLossy() bool    { return true }
 
 // ExactTokenizer returns the exact string as a token.
-type ExactTokenizer struct{}
+type ExactTokenizer struct{ lang string }
 
 func (t ExactTokenizer) Name() string { return "exact" }
 func (t ExactTokenizer) Type() string { return "string" }
 func (t ExactTokenizer) Tokens(v interface{}) ([]string, error) {
-	if term, ok := v.(string); ok {
+	term, ok := v.(string)
+	if !ok {
+		return nil, errors.Errorf("Exact indices only supported for string types")
+	}
+
+	if t.lang == "" {
 		return []string{term}, nil
 	}
-	return nil, errors.Errorf("Exact indices only supported for string types")
+
+	lang := LangBase(t.lang)
+	term = lang + term
+	return []string{term}, nil
 }
-func (t ExactTokenizer) Identifier() byte { return IdentExact }
+func (t ExactTokenizer) Identifier() byte {
+	if t.lang == "" {
+		return IdentExact
+	}
+	return IdentExactLang
+}
 func (t ExactTokenizer) IsSortable() bool { return true }
 func (t ExactTokenizer) IsLossy() bool    { return false }
 
@@ -313,7 +327,7 @@ func (t FullTextTokenizer) Tokens(v interface{}) ([]string, error) {
 	if !ok || str == "" {
 		return []string{}, nil
 	}
-	lang := langBase(t.lang)
+	lang := LangBase(t.lang)
 	// pass 1 - lowercase and normalize input
 	tokens := fulltextAnalyzer.Analyze([]byte(str))
 	// pass 2 - filter stop words

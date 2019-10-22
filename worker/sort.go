@@ -223,11 +223,19 @@ func sortWithIndex(ctx context.Context, ts *pb.SortMessage) *sortresult {
 		return resultWithError(errors.Errorf("Attribute %s is not sortable.", order.Attr))
 	}
 
+	var lang string
+	if len(order.Langs) > 0 {
+		// Only one languge is allowed.
+		lang = order.Langs[0]
+		tokenizer = tok.GetLangTokenizer(tokenizer, lang)
+		lang = tok.LangBase(lang)
+	}
+
 	// Iterate over every bucket / token.
 	iterOpt := badger.DefaultIteratorOptions
 	iterOpt.PrefetchValues = false
 	iterOpt.Reverse = order.Desc
-	iterOpt.Prefix = x.IndexKey(order.Attr, string(tokenizer.Identifier()))
+	iterOpt.Prefix = append(x.IndexKey(order.Attr, string(tokenizer.Identifier())), []byte(lang)...)
 	txn := pstore.NewTransactionAt(ts.ReadTs, false)
 	defer txn.Discard()
 	var seekKey []byte

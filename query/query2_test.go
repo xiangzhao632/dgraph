@@ -18,9 +18,11 @@ package query
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
+	"github.com/dgraph-io/dgo/v2/protos/api"
 	"github.com/stretchr/testify/require"
 )
 
@@ -788,6 +790,41 @@ func TestToFastJSONReverseFilter(t *testing.T) {
 	require.JSONEq(t,
 		`{"data": {"me":[{"name":"Glenn Rhee","~friend":[{"name":"Andrea"}]}]}}`,
 		js)
+}
+
+func TestOrderForLangDirectiveQuery(t *testing.T) {
+	err := client.Alter(context.Background(), &api.Operation{DropAll: true})
+	if err != nil {
+		panic(fmt.Sprintf("Could not perform DropAll op. Got error %v", err.Error()))
+	}
+
+	const testSchema = `
+	<category_type>: string @index(hash) .
+	<name>: string @index(exact, term, trigram) @lang @count .
+	`
+
+	setSchema(testSchema)
+
+	addTriplesToCluster(`{
+		set {
+		  <1> <name> "A" .
+		  <1> <name@ru> "D" .
+		  <1> <category_type> "Test" .
+		  <2> <name> "B" .
+		  <2> <name@ru> "C" .
+		  <2> <category_type> "Test" .
+		  }
+	}`)
+
+	query := `{
+		q(func:eq(category_type, "Test"),orderasc:name@ru)  {
+		  name@ru
+		  name
+		}
+	  }`
+
+	js := processQueryNoErr(t, query)
+	fmt.Println(js)
 }
 
 // Test sorting / ordering by dob.
