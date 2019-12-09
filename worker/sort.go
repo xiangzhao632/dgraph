@@ -231,7 +231,7 @@ func sortWithIndex(ctx context.Context, ts *pb.SortMessage) *sortresult {
 		langTokenizer, ok := tokenizer.(tok.LangTokenizer)
 		if !ok {
 			return resultWithError(errors.Errorf(
-				"Invalid tokenizer for language %s.", lang))
+				"Invalid %s tokenizer for language %s.", tokenizer.Name(), lang))
 		}
 		prefix = langTokenizer.Prefix()
 	} else {
