@@ -35,6 +35,7 @@ import (
 	"github.com/dgraph-io/dgraph/dgraph/cmd/zero"
 	"github.com/dgraph-io/dgraph/x"
 	"github.com/dgraph-io/dgraph/xidmap"
+	"github.com/dgryski/go-farm"
 	"github.com/dustin/go-humanize/english"
 )
 
@@ -91,6 +92,10 @@ type Counter struct {
 	Elapsed time.Duration
 }
 
+var (
+	prevTxnCount uint64
+)
+
 // handleError inspects errors and terminates if the errors are non-recoverable.
 // A gRPC code is Internal if there is an unforeseen issue that needs attention.
 // A gRPC code is Unavailable when we can't possibly reach the remote server, most likely the
@@ -117,6 +122,53 @@ func handleError(err error, reqNum uint64, isRetry bool) {
 	}
 }
 
+func (l *loader) requestDone(req *api.Mutation) {
+	batchID := req.GetBatchId()
+
+	uidsLock.Lock()
+	defer uidsLock.Unlock()
+	if _, found := requests[batchID]; found {
+		if opt.verbose {
+			fmt.Println("Request done: ", batchID)
+		}
+		delete(requests, batchID)
+	} else {
+		return
+	}
+
+	for _, nq := range req.Set {
+		subjectKey := farm.Fingerprint64([]byte(nq.Subject))
+		if val, found := currentUIDS[subjectKey]; found && val == batchID {
+			delete(currentUIDS, subjectKey)
+		}
+
+		if len(nq.ObjectId) == 0 {
+			continue
+		}
+
+		objectKey := farm.Fingerprint64([]byte(nq.ObjectId))
+		if val, found := currentUIDS[objectKey]; found && val == batchID {
+			delete(currentUIDS, objectKey)
+		}
+	}
+
+	for requestID, request := range requests {
+		conflict := false
+		for id := range revBatchDepency[requestID] {
+			if _, found := requests[id]; found {
+				conflict = true
+				break
+			}
+		}
+		if !conflict {
+			if opt.verbose {
+				fmt.Println("Batch ID sent: ", requestID)
+			}
+			l.reqs <- *request
+		}
+	}
+}
+
 func (l *loader) infinitelyRetry(req api.Mutation, reqNum uint64) {
 	defer l.retryRequestsWg.Done()
 	nretries := 1
@@ -131,6 +183,7 @@ func (l *loader) infinitelyRetry(req api.Mutation, reqNum uint64) {
 			}
 			atomic.AddUint64(&l.nquads, uint64(len(req.Set)))
 			atomic.AddUint64(&l.txns, 1)
+			l.requestDone(&req)
 			return
 		}
 		nretries++
@@ -151,6 +204,7 @@ func (l *loader) request(req api.Mutation, reqNum uint64) {
 	if err == nil {
 		atomic.AddUint64(&l.nquads, uint64(len(req.Set)))
 		atomic.AddUint64(&l.txns, 1)
+		l.requestDone(&req)
 		return
 	}
 	handleError(err, reqNum, false)

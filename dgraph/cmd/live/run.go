@@ -44,6 +44,7 @@ import (
 	"github.com/dgraph-io/dgraph/x"
 	"github.com/dgraph-io/dgraph/xidmap"
 
+	"github.com/dgryski/go-farm"
 	"github.com/golang/glog"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
@@ -67,7 +68,14 @@ type options struct {
 var (
 	opt options
 	// Live is the sub-command invoked when running "dgraph live".
-	Live x.SubCommand
+	Live            x.SubCommand
+	reversePreds    map[string]struct{}
+	requests        map[uint64]*api.Mutation
+	currentUIDS     map[uint64]uint64
+	batchDepency    map[uint64]map[uint64]struct{}
+	revBatchDepency map[uint64]map[uint64]struct{}
+	indegree        map[uint64]uint64
+	uidsLock        sync.RWMutex
 )
 
 func init() {
@@ -136,6 +144,15 @@ func processSchemaFile(ctx context.Context, file string, dgraphClient *dgo.Dgrap
 		x.Checkf(err, "Error while reading file")
 	}
 
+	reversePreds = make(map[string]struct{})
+	for _, schemaLine := range strings.Split(string(b), "\n") {
+		if !strings.Contains(schemaLine, "@reverse") {
+			continue
+		}
+		predicate := strings.Fields(schemaLine)[0]
+		reversePreds[predicate] = struct{}{}
+	}
+
 	op := &api.Operation{}
 	op.Schema = string(b)
 	return dgraphClient.Alter(ctx, op)
@@ -186,19 +203,71 @@ func (l *loader) processLoadFile(ctx context.Context, rd *bufio.Reader, ck chunk
 	// Spin a goroutine to push NQuads to mutation channel.
 	go func() {
 		defer wg.Done()
+		batchNum := uint64(0)
+		requests = make(map[uint64]*api.Mutation)
+		currentUIDS = make(map[uint64]uint64)
+		batchDepency = make(map[uint64]map[uint64]struct{})
+		revBatchDepency = make(map[uint64]map[uint64]struct{})
 		for nqs := range nqbuf.Ch() {
 			if len(nqs) == 0 {
 				continue
 			}
+
+			uidsLock.Lock()
+			conflictCount := uint64(0)
 			for _, nq := range nqs {
 				nq.Subject = l.uid(nq.Subject)
-				if len(nq.ObjectId) > 0 {
-					nq.ObjectId = l.uid(nq.ObjectId)
+				subjectKey := farm.Fingerprint64([]byte(nq.Subject))
+				if val, found := currentUIDS[subjectKey]; found && val < batchNum {
+					conflictCount++
+
+					if _, found := batchDepency[val]; !found {
+						batchDepency[val] = make(map[uint64]struct{})
+					}
+					batchDepency[val][batchNum] = struct{}{}
+
+					if _, found := revBatchDepency[batchNum]; !found {
+						revBatchDepency[batchNum] = make(map[uint64]struct{})
+					}
+					revBatchDepency[batchNum][val] = struct{}{}
 				}
+				currentUIDS[subjectKey] = batchNum
+
+				if len(nq.ObjectId) == 0 {
+					continue
+				}
+
+				nq.ObjectId = l.uid(nq.ObjectId)
+				objectKey := farm.Fingerprint64([]byte(nq.ObjectId))
+				if val, found := currentUIDS[objectKey]; found && val < batchNum {
+					conflictCount++
+
+					if _, found := batchDepency[val]; !found {
+						batchDepency[val] = make(map[uint64]struct{})
+					}
+					batchDepency[val][batchNum] = struct{}{}
+
+					if _, found := revBatchDepency[batchNum]; !found {
+						revBatchDepency[batchNum] = make(map[uint64]struct{})
+					}
+					revBatchDepency[batchNum][val] = struct{}{}
+				}
+				currentUIDS[objectKey] = batchNum
+			}
+			if opt.verbose {
+				fmt.Println("Batch ID ", batchNum, revBatchDepency[batchNum])
 			}
 
-			mu := api.Mutation{Set: nqs}
-			l.reqs <- mu
+			mu := api.Mutation{Set: nqs, BatchId: batchNum}
+			requests[mu.BatchId] = &mu
+			uidsLock.Unlock()
+			batchNum++
+			if conflictCount == 0 {
+				if opt.verbose {
+					fmt.Println("Batch ID sent: ", mu.BatchId)
+				}
+				l.reqs <- mu
+			}
 		}
 	}()
 
@@ -344,12 +413,13 @@ func run() error {
 		}
 	}
 
-	close(l.reqs)
 	// First we wait for requestsWg, when it is done we know all retry requests have been added
 	// to retryRequestsWg. We can't have the same waitgroup as by the time we call Wait, we can't
 	// be sure that all retry requests have been added to the waitgroup.
 	l.requestsWg.Wait()
 	l.retryRequestsWg.Wait()
+	close(l.reqs)
+
 	c := l.Counter()
 	var rate uint64
 	if c.Elapsed.Seconds() < 1 {

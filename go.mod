@@ -61,3 +61,7 @@ require (
 	gopkg.in/ini.v1 v1.48.0 // indirect
 	gopkg.in/yaml.v2 v2.2.2
 )
+
+replace github.com/dgraph-io/dgo/v2 => /home/arijit/go/src/github.com/dgraph-io/dgo
+
+replace github.com/dgraph-io/dgo/v2/protos/api => /home/arijit/go/src/github.com/dgraph-io/dgo/protos/api
