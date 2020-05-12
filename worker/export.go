@@ -20,6 +20,8 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -30,13 +32,13 @@ import (
 
 	"github.com/golang/glog"
 	"github.com/pkg/errors"
-	"golang.org/x/net/context"
 
 	"github.com/dgraph-io/badger/v2"
 	bpb "github.com/dgraph-io/badger/v2/pb"
 
 	"github.com/dgraph-io/dgo/v2/protos/api"
 
+	"github.com/dgraph-io/dgraph/ee/enc"
 	"github.com/dgraph-io/dgraph/posting"
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/types"
@@ -126,7 +128,7 @@ func escapedString(str string) string {
 		// All valid stings should be able to be escaped to a JSON string so
 		// it's safe to panic here. Marshal has to return an error because it
 		// accepts an interface.
-		panic("Could not marshal string to JSON string")
+		x.Panic(errors.New("Could not marshal string to JSON string"))
 	}
 	return string(byt)
 }
@@ -333,7 +335,15 @@ func toType(attr string, update pb.TypeUpdate) (*bpb.KVList, error) {
 func fieldToString(update *pb.SchemaUpdate) string {
 	var builder strings.Builder
 	x.Check2(builder.WriteString("\t"))
-	x.Check2(builder.WriteString(update.Predicate))
+	// While exporting type definitions, "<" and ">" brackets must be written around
+	// the name of reverse predicates or Dgraph won't be able to parse the exported schema.
+	if strings.HasPrefix(update.Predicate, "~") {
+		x.Check2(builder.WriteString("<"))
+		x.Check2(builder.WriteString(update.Predicate))
+		x.Check2(builder.WriteString(">"))
+	} else {
+		x.Check2(builder.WriteString(update.Predicate))
+	}
 	x.Check2(builder.WriteString("\n"))
 	return builder.String()
 }
@@ -350,9 +360,12 @@ func (writer *fileWriter) open(fpath string) error {
 	if err != nil {
 		return err
 	}
-
 	writer.bw = bufio.NewWriterSize(writer.fd, 1e6)
-	writer.gw, err = gzip.NewWriterLevel(writer.bw, gzip.BestCompression)
+	w, err := enc.GetWriter(Config.BadgerKeyFile, writer.bw)
+	if err != nil {
+		return err
+	}
+	writer.gw, err = gzip.NewWriterLevel(w, gzip.BestCompression)
 	return err
 }
 
@@ -427,6 +440,13 @@ func export(ctx context.Context, in *pb.ExportRequest) error {
 	stream.ChooseKey = func(item *badger.Item) bool {
 		pk, err := x.Parse(item.Key())
 		if err != nil {
+			glog.Errorf("error %v while parsing key %v during export. Skip.", err, hex.EncodeToString(item.Key()))
+			return false
+		}
+
+		// Do not pick keys storing parts of a multi-part list. They will be read
+		// from the main key.
+		if pk.HasStartUid {
 			return false
 		}
 
@@ -451,6 +471,7 @@ func export(ctx context.Context, in *pb.ExportRequest) error {
 		item := itr.Item()
 		pk, err := x.Parse(item.Key())
 		if err != nil {
+			glog.Errorf("error %v while parsing key %v during export. Skip.", err, hex.EncodeToString(item.Key()))
 			return nil, err
 		}
 		e := &exporter{
@@ -520,6 +541,12 @@ func export(ctx context.Context, in *pb.ExportRequest) error {
 
 	stream.Send = func(list *bpb.KVList) error {
 		for _, kv := range list.Kv {
+			// Skip nodes that have no data. Otherwise, the exported data could have
+			// formatting and/or syntax errors.
+			if len(kv.Value) == 0 {
+				continue
+			}
+
 			var writer *fileWriter
 			switch kv.Version {
 			case 1: // data

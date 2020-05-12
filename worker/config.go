@@ -46,6 +46,10 @@ type Options struct {
 	BadgerVlog string
 	// BadgerKeyFile is the file containing the key used for encryption. Enterprise only feature.
 	BadgerKeyFile string
+	// BadgerCompressionLevel is the ZSTD compression level used by badger. A
+	// higher value means more CPU intensive compression and better compression
+	// ratio.
+	BadgerCompressionLevel int
 	// WALDir is the path to the directory storing the write-ahead log.
 	WALDir string
 	// MutationsMode is the mode used to handle mutation requests.
@@ -90,8 +94,8 @@ func SetConfiguration(newConfig *Options) {
 	newConfig.validate()
 	Config = *newConfig
 
-	posting.Config.Mu.Lock()
-	defer posting.Config.Mu.Unlock()
+	posting.Config.Lock()
+	defer posting.Config.Unlock()
 	posting.Config.AllottedMemory = Config.AllottedMemory
 }
 

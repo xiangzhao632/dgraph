@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
+	"math"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -74,6 +75,11 @@ func addEdge(t *testing.T, edge *pb.DirectedEdge, l *posting.List) {
 	commitTransaction(t, edge, l)
 }
 
+func delEdge(t *testing.T, edge *pb.DirectedEdge, l *posting.List) {
+	edge.Op = pb.DirectedEdge_DEL
+	commitTransaction(t, edge, l)
+}
+
 func setClusterEdge(t *testing.T, dg *dgo.Dgraph, rdf string) {
 	mu := &api.Mutation{SetNquads: []byte(rdf), CommitNow: true}
 	err := testutil.RetryMutation(dg, mu)
@@ -86,7 +92,7 @@ func delClusterEdge(t *testing.T, dg *dgo.Dgraph, rdf string) {
 	require.NoError(t, err)
 }
 func getOrCreate(key []byte) *posting.List {
-	l, err := posting.GetNoStore(key)
+	l, err := posting.GetNoStore(key, math.MaxUint64)
 	x.Checkf(err, "While calling posting.Get")
 	return l
 }

@@ -18,8 +18,8 @@ package alpha
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
-	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -37,6 +37,7 @@ import (
 	"github.com/dgraph-io/dgo/v2/protos/api"
 	"github.com/dgraph-io/dgraph/edgraph"
 	"github.com/dgraph-io/dgraph/ee/enc"
+	"github.com/dgraph-io/dgraph/graphql/admin"
 	"github.com/dgraph-io/dgraph/posting"
 	"github.com/dgraph-io/dgraph/schema"
 	"github.com/dgraph-io/dgraph/tok"
@@ -50,7 +51,6 @@ import (
 	"go.opencensus.io/plugin/ocgrpc"
 	otrace "go.opencensus.io/trace"
 	"go.opencensus.io/zpages"
-	"golang.org/x/net/context"
 	"golang.org/x/net/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -58,7 +58,7 @@ import (
 	"google.golang.org/grpc/health"
 	hapi "google.golang.org/grpc/health/grpc_health_v1"
 
-	_ "github.com/vektah/gqlparser/validator/rules" // make gql validator init() all rules
+	_ "github.com/vektah/gqlparser/v2/validator/rules" // make gql validator init() all rules
 )
 
 const (
@@ -106,6 +106,8 @@ they form a Raft group and provide synchronous replication.
 	flag.String("badger.vlog", "mmap",
 		"[mmap, disk] Specifies how Badger Value log is stored."+
 			" mmap consumes more RAM, but provides better performance.")
+	flag.Int("badger.compression_level", 3,
+		"The compression level for Badger. A higher value uses more resources.")
 	flag.String("encryption_key_file", "",
 		"The file that stores the encryption key. The key size must be 16, 24, or 32 bytes long. "+
 			"The key size determines the corresponding block size for AES encryption "+
@@ -138,7 +140,7 @@ they form a Raft group and provide synchronous replication.
 	flag.String("my", "",
 		"IP_ADDRESS:PORT of this Dgraph Alpha, so other Dgraph Alphas can talk to this.")
 	flag.StringP("zero", "z", fmt.Sprintf("localhost:%d", x.PortZeroGrpc),
-		"IP_ADDRESS:PORT of a Dgraph Zero.")
+		"Comma separated list of Dgraph zero addresses of the form IP_ADDRESS:PORT.")
 	flag.Uint64("idx", 0,
 		"Optional Raft ID that this Dgraph Alpha will use to join RAFT groups.")
 	flag.Int("max_retries", -1,
@@ -148,6 +150,7 @@ they form a Raft group and provide synchronous replication.
 		"If set, all Alter requests to Dgraph would need to have this token."+
 			" The token can be passed as follows: For HTTP requests, in X-Dgraph-AuthToken header."+
 			" For Grpc, in auth-token key in the context.")
+	flag.Bool("enable_sentry", true, "Turn on/off sending events to Sentry (default on).")
 
 	flag.String("acl_secret_file", "", "The file that stores the HMAC secret, "+
 		"which is used for signing the JWT and should have at least 32 ASCII characters. "+
@@ -163,6 +166,7 @@ they form a Raft group and provide synchronous replication.
 			"Actual usage by the process would be more than specified here.")
 	flag.String("mutations", "allow",
 		"Set mutation mode to allow, disallow, or strict.")
+	flag.Bool("telemetry", true, "Send anonymous telemetry data to Dgraph devs.")
 
 	// Useful for running multiple servers on the same machine.
 	flag.IntP("port_offset", "o", 0,
@@ -187,8 +191,8 @@ they form a Raft group and provide synchronous replication.
 	// By default Go GRPC traces all requests.
 	grpc.EnableTracing = false
 
-	// flag.Bool("graphql_introspection", true, "Set to false for no GraphQL schema introspection")
-
+	flag.Bool("graphql_introspection", true, "Set to false for no GraphQL schema introspection")
+	flag.Bool("ludicrous_mode", false, "Run alpha in ludicrous mode")
 }
 
 func setupCustomTokenizers() {
@@ -282,20 +286,20 @@ func grpcPort() int {
 
 func healthCheck(w http.ResponseWriter, r *http.Request) {
 	x.AddCorsHeaders(w)
+	var err error
 
 	if _, ok := r.URL.Query()["all"]; ok {
-		var err error
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 
-		ctx := attachAccessJwt(context.Background(), r)
+		ctx := x.AttachAccessJwt(context.Background(), r)
 		var resp *api.Response
-		if resp, err = (&edgraph.Server{}).HealthAll(ctx); err != nil {
+		if resp, err = (&edgraph.Server{}).Health(ctx, true); err != nil {
 			x.SetStatus(w, x.Error, err.Error())
 			return
 		}
 		if resp == nil {
-			x.SetStatus(w, x.ErrorNoData, "No state information available.")
+			x.SetStatus(w, x.ErrorNoData, "No health information available.")
 			return
 		}
 		_, _ = w.Write(resp.Json)
@@ -314,20 +318,18 @@ func healthCheck(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	info := struct {
-		Version  string        `json:"version"`
-		Instance string        `json:"instance"`
-		Uptime   time.Duration `json:"uptime"`
-	}{
-		Version:  x.Version(),
-		Instance: "alpha",
-		Uptime:   time.Since(startTime) / time.Second,
+	var resp *api.Response
+	if resp, err = (&edgraph.Server{}).Health(context.Background(), false); err != nil {
+		x.SetStatus(w, x.Error, err.Error())
+		return
 	}
-	data, _ := json.Marshal(info)
-
+	if resp == nil {
+		x.SetStatus(w, x.ErrorNoData, "No health information available.")
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(data)
+	_, _ = w.Write(resp.Json)
 }
 
 func stateHandler(w http.ResponseWriter, r *http.Request) {
@@ -336,7 +338,7 @@ func stateHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	ctx := context.Background()
-	ctx = attachAccessJwt(ctx, r)
+	ctx = x.AttachAccessJwt(ctx, r)
 
 	var aResp *api.Response
 	if aResp, err = (&edgraph.Server{}).State(ctx); err != nil {
@@ -413,7 +415,7 @@ func serveHTTP(l net.Listener, tlsCfg *tls.Config, wg *sync.WaitGroup) {
 	}
 }
 
-func setupServer() {
+func setupServer(closer *y.Closer) {
 	go worker.RunServer(bindall) // For pb.communication.
 
 	laddr := "localhost"
@@ -453,26 +455,30 @@ func setupServer() {
 	http.HandleFunc("/admin/export", exportHandler)
 	http.HandleFunc("/admin/config/lru_mb", memoryLimitHandler)
 
-	// introspection := Alpha.Conf.GetBool("graphql_introspection")
-	// mainServer, adminServer := admin.NewServers(introspection)
-	// http.Handle("/graphql", mainServer.HTTPHandler())
+	introspection := Alpha.Conf.GetBool("graphql_introspection")
+	mainServer, adminServer := admin.NewServers(introspection, closer)
+	http.Handle("/graphql", mainServer.HTTPHandler())
 
-	// whitelist := func(h http.Handler) http.Handler {
-	// 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-	// 		if !handlerInit(w, r, map[string]bool{
-	// 			http.MethodPost: true,
-	// 			http.MethodGet:  true,
-	// 		}) {
-	// 			return
-	// 		}
-	// 		h.ServeHTTP(w, r)
-	// 	})
-	// }
-	// http.Handle("/admin", whitelist(adminServer.HTTPHandler()))
+	whitelist := func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !handlerInit(w, r, map[string]bool{
+				http.MethodPost:    true,
+				http.MethodGet:     true,
+				http.MethodOptions: true,
+			}) {
+				return
+			}
+			h.ServeHTTP(w, r)
+		})
+	}
+	http.Handle("/admin", whitelist(adminServer.HTTPHandler()))
+	http.HandleFunc("/admin/schema", func(w http.ResponseWriter, r *http.Request) {
+		adminSchemaHandler(w, r, adminServer)
+	})
 
-	// addr := fmt.Sprintf("%s:%d", laddr, httpPort())
-	// glog.Infof("Bringing up GraphQL HTTP API at %s/graphql", addr)
-	// glog.Infof("Bringing up GraphQL HTTP admin API at %s/admin", addr)
+	addr := fmt.Sprintf("%s:%d", laddr, httpPort())
+	glog.Infof("Bringing up GraphQL HTTP API at %s/graphql", addr)
+	glog.Infof("Bringing up GraphQL HTTP admin API at %s/admin", addr)
 
 	// Add OpenCensus z-pages.
 	zpages.Handle(http.DefaultServeMux, "/z")
@@ -486,9 +492,14 @@ func setupServer() {
 	go serveGRPC(grpcListener, tlsCfg, &wg)
 	go serveHTTP(httpListener, tlsCfg, &wg)
 
+	if Alpha.Conf.GetBool("telemetry") {
+		go edgraph.PeriodicallyPostTelemetry()
+	}
+
 	go func() {
 		defer wg.Done()
-		<-shutdownCh
+		<-worker.ShutdownCh
+
 		// Stops grpc/http servers; Already accepted connections are not closed.
 		if err := grpcListener.Close(); err != nil {
 			glog.Warningf("Error while closing gRPC listener: %s", err)
@@ -503,15 +514,14 @@ func setupServer() {
 	wg.Wait()
 }
 
-var shutdownCh chan struct{}
-
 func run() {
 	bindall = Alpha.Conf.GetBool("bindall")
 
 	opts := worker.Options{
-		BadgerTables:  Alpha.Conf.GetString("badger.tables"),
-		BadgerVlog:    Alpha.Conf.GetString("badger.vlog"),
-		BadgerKeyFile: Alpha.Conf.GetString("encryption_key_file"),
+		BadgerTables:           Alpha.Conf.GetString("badger.tables"),
+		BadgerVlog:             Alpha.Conf.GetString("badger.vlog"),
+		BadgerKeyFile:          Alpha.Conf.GetString("encryption_key_file"),
+		BadgerCompressionLevel: Alpha.Conf.GetInt("badger.compression_level"),
 
 		PostingDir: Alpha.Conf.GetString("postings"),
 		WALDir:     Alpha.Conf.GetString("wal"),
@@ -569,7 +579,7 @@ func run() {
 		NumPendingProposals: Alpha.Conf.GetInt("pending_proposals"),
 		Tracing:             Alpha.Conf.GetFloat64("trace"),
 		MyAddr:              Alpha.Conf.GetString("my"),
-		ZeroAddr:            Alpha.Conf.GetString("zero"),
+		ZeroAddr:            strings.Split(Alpha.Conf.GetString("zero"), ","),
 		RaftId:              cast.ToUint64(Alpha.Conf.GetString("idx")),
 		WhiteListedIPRanges: ips,
 		MaxRetries:          Alpha.Conf.GetInt("max_retries"),
@@ -578,6 +588,8 @@ func run() {
 		SnapshotAfter:       Alpha.Conf.GetInt("snapshot_after"),
 		AbortOlderThan:      abortDur,
 		StartTime:           startTime,
+		LudicrousMode:       Alpha.Conf.GetBool("ludicrous_mode"),
+		BadgerKeyFile:       worker.Config.BadgerKeyFile,
 	}
 
 	setupCustomTokenizers()
@@ -586,8 +598,14 @@ func run() {
 	x.Config.QueryEdgeLimit = cast.ToUint64(Alpha.Conf.GetString("query_edge_limit"))
 	x.Config.NormalizeNodeLimit = cast.ToInt(Alpha.Conf.GetString("normalize_node_limit"))
 
-	x.PrintVersion()
+	if Alpha.Conf.GetBool("enable_sentry") {
+		x.InitSentry(enc.EeBuild)
+		defer x.FlushSentry()
+		x.ConfigureSentryScope("alpha")
+		x.WrapPanics()
+	}
 
+	x.PrintVersion()
 	glog.Infof("x.Config: %+v", x.Config)
 	glog.Infof("x.WorkerConfig: %+v", x.WorkerConfig)
 	glog.Infof("worker.Config: %+v", worker.Config)
@@ -614,7 +632,7 @@ func run() {
 
 	// setup shutdown os signal handler
 	sdCh := make(chan os.Signal, 3)
-	shutdownCh = make(chan struct{})
+	worker.ShutdownCh = make(chan struct{})
 
 	defer func() {
 		signal.Stop(sdCh)
@@ -626,9 +644,9 @@ func run() {
 		var numShutDownSig int
 		for range sdCh {
 			select {
-			case <-shutdownCh:
+			case <-worker.ShutdownCh:
 			default:
-				close(shutdownCh)
+				close(worker.ShutdownCh)
 			}
 			numShutDownSig++
 			glog.Infoln("Caught Ctrl-C. Terminating now (this may take a few seconds)...")
@@ -649,10 +667,15 @@ func run() {
 		edgraph.RefreshAcls(aclCloser)
 	}()
 
-	setupServer()
+	// Graphql subscribes to alpha to get schema updates. We need to close that before we
+	// close alpha. This closer is for closing and waiting that subscription.
+	adminCloser := y.NewCloser(1)
+
+	setupServer(adminCloser)
 	glog.Infoln("GRPC and HTTP stopped.")
 	aclCloser.SignalAndWait()
 	worker.BlockingStop()
+	adminCloser.SignalAndWait()
 	glog.Info("Disposing server state.")
 	worker.State.Dispose()
 	glog.Infoln("Server shutdown. Bye!")

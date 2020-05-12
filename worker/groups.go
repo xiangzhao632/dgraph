@@ -17,14 +17,13 @@
 package worker
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"golang.org/x/net/context"
 
 	"github.com/dgraph-io/badger/v2"
 	badgerpb "github.com/dgraph-io/badger/v2/pb"
@@ -88,8 +87,11 @@ func StartRaftNodes(walStore *badger.DB, bindall bool) {
 	}
 
 	x.AssertTruef(len(x.WorkerConfig.ZeroAddr) > 0, "Providing dgraphzero address is mandatory.")
-	x.AssertTruef(x.WorkerConfig.ZeroAddr != x.WorkerConfig.MyAddr,
-		"Dgraph Zero address and Dgraph address (IP:Port) can't be the same.")
+	for _, zeroAddr := range x.WorkerConfig.ZeroAddr {
+		x.AssertTruef(zeroAddr != x.WorkerConfig.MyAddr,
+			"Dgraph Zero address %s and Dgraph address (IP:Port) %s can't be the same.",
+			zeroAddr, x.WorkerConfig.MyAddr)
+	}
 
 	if x.WorkerConfig.RaftId == 0 {
 		id, err := raftwal.RaftId(walStore)
@@ -114,6 +116,7 @@ func StartRaftNodes(walStore *badger.DB, bindall bool) {
 	}
 	var connState *pb.ConnectionState
 	var err error
+
 	for { // Keep on retrying. See: https://github.com/dgraph-io/dgraph/issues/2289
 		pl := gr.connToZeroLeader()
 		if pl == nil {
@@ -158,6 +161,7 @@ func StartRaftNodes(walStore *badger.DB, bindall bool) {
 
 	gr.informZeroAboutTablets()
 	gr.proposeInitialSchema()
+	gr.proposeInitialTypes()
 }
 
 func (g *groupi) informZeroAboutTablets() {
@@ -186,20 +190,31 @@ func (g *groupi) informZeroAboutTablets() {
 	}
 }
 
+func (g *groupi) proposeInitialTypes() {
+	initialTypes := schema.InitialTypes()
+	for _, t := range initialTypes {
+		if _, ok := schema.State().GetType(t.TypeName); ok {
+			continue
+		}
+		g.upsertSchema(nil, t)
+	}
+}
+
 func (g *groupi) proposeInitialSchema() {
 	initialSchema := schema.InitialSchema()
+	ctx := context.Background()
 	for _, s := range initialSchema {
 		if gid, err := g.BelongsToReadOnly(s.Predicate, 0); err != nil {
 			glog.Errorf("Error getting tablet for predicate %s. Will force schema proposal.",
 				s.Predicate)
-			g.upsertSchema(s)
+			g.upsertSchema(s, nil)
 		} else if gid == 0 {
-			g.upsertSchema(s)
-		} else if curr, _ := schema.State().Get(s.Predicate); gid == g.groupId() &&
+			g.upsertSchema(s, nil)
+		} else if curr, _ := schema.State().Get(ctx, s.Predicate); gid == g.groupId() &&
 			!proto.Equal(s, &curr) {
 			// If this tablet is served to the group, do not upsert the schema unless the
 			// stored schema and the proposed one are different.
-			g.upsertSchema(s)
+			g.upsertSchema(s, nil)
 		} else {
 			// The schema for this predicate has already been proposed.
 			glog.V(1).Infof("Skipping initial schema upsert for predicate %s", s.Predicate)
@@ -208,7 +223,7 @@ func (g *groupi) proposeInitialSchema() {
 	}
 }
 
-func (g *groupi) upsertSchema(sch *pb.SchemaUpdate) {
+func (g *groupi) upsertSchema(sch *pb.SchemaUpdate, typ *pb.TypeUpdate) {
 	// Propose schema mutation.
 	var m pb.Mutations
 	// schema for a reserved predicate is not changed once set.
@@ -221,7 +236,12 @@ func (g *groupi) upsertSchema(sch *pb.SchemaUpdate) {
 	}
 
 	m.StartTs = ts.StartId
-	m.Schema = append(m.Schema, sch)
+	if sch != nil {
+		m.Schema = append(m.Schema, sch)
+	}
+	if typ != nil {
+		m.Types = append(m.Types, typ)
+	}
 
 	// This would propose the schema mutation and make sure some node serves this predicate
 	// and has the schema defined above.
@@ -265,7 +285,7 @@ func UpdateMembershipState(ctx context.Context) error {
 	g := groups()
 	p := g.Leader(0)
 	if p == nil {
-		return errors.Errorf("Don't have the address of any dgraphzero server")
+		return errors.Errorf("don't have the address of any dgraph zero leader")
 	}
 
 	c := pb.NewZeroClient(p.Get())
@@ -630,14 +650,19 @@ func (g *groupi) connToZeroLeader() *conn.Pool {
 	// No leader found. Let's get the latest membership state from Zero.
 	delay := connBaseDelay
 	maxHalfDelay := time.Second
-	for { // Keep on retrying. See: https://github.com/dgraph-io/dgraph/issues/2289
+	for i := 0; ; i++ { // Keep on retrying. See: https://github.com/dgraph-io/dgraph/issues/2289
 		time.Sleep(delay)
 		if delay <= maxHalfDelay {
 			delay *= 2
 		}
+
+		zAddrList := x.WorkerConfig.ZeroAddr
+		// Pick addresses in round robin manner.
+		addr := zAddrList[i%len(zAddrList)]
+
 		pl := g.AnyServer(0)
 		if pl == nil {
-			pl = conn.GetPools().Connect(x.WorkerConfig.ZeroAddr)
+			pl = conn.GetPools().Connect(addr)
 		}
 		if pl == nil {
 			glog.V(1).Infof("No healthy Zero server found. Retrying...")
@@ -1042,34 +1067,43 @@ func askZeroForEE() bool {
 }
 
 // SubscribeForUpdates will listen for updates for the given group.
-func SubscribeForUpdates(prefixes [][]byte, cb func(kvs *badgerpb.KVList), group uint32) {
-	for {
-		// Connect to any of the group 1 nodes.
-		members := groups().AnyTwoServers(group)
-		// There may be a lag while starting so keep retrying.
-		if len(members) == 0 {
-			continue
-		}
-		pool := conn.GetPools().Connect(members[0])
-		client := pb.NewWorkerClient(pool.Get())
+func SubscribeForUpdates(prefixes [][]byte, cb func(kvs *badgerpb.KVList), group uint32,
+	closer *y.Closer) {
+	defer closer.Done()
 
-		// Get Subscriber stream.
-		stream, err := client.Subscribe(context.Background(), &pb.SubscriptionRequest{
-			Prefixes: prefixes,
-		})
-		if err != nil {
-			glog.Errorf("Error from alpha client subscribe: %v", err)
-			continue
-		}
-	receiver:
-		for {
-			// Listen for updates.
-			kvs, err := stream.Recv()
-			if err != nil {
-				glog.Errorf("Error from worker subscribe stream: %v", err)
-				break receiver
+	for {
+		select {
+		case <-closer.HasBeenClosed():
+			return
+		default:
+
+			// Connect to any of the group 1 nodes.
+			members := groups().AnyTwoServers(group)
+			// There may be a lag while starting so keep retrying.
+			if len(members) == 0 {
+				continue
 			}
-			cb(kvs)
+			pool := conn.GetPools().Connect(members[0])
+			client := pb.NewWorkerClient(pool.Get())
+
+			// Get Subscriber stream.
+			stream, err := client.Subscribe(context.Background(),
+				&pb.SubscriptionRequest{Prefixes: prefixes})
+			if err != nil {
+				glog.Errorf("Error from alpha client subscribe: %v", err)
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+		receiver:
+			for {
+				// Listen for updates.
+				kvs, err := stream.Recv()
+				if err != nil {
+					glog.Errorf("Error from worker subscribe stream: %v", err)
+					break receiver
+				}
+				cb(kvs)
+			}
 		}
 	}
 }

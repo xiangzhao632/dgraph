@@ -18,13 +18,14 @@ package schema
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/pkg/errors"
-	"github.com/vektah/gqlparser/ast"
-	"github.com/vektah/gqlparser/gqlerror"
-	"github.com/vektah/gqlparser/parser"
-	"github.com/vektah/gqlparser/validator"
+	"github.com/vektah/gqlparser/v2/ast"
+	"github.com/vektah/gqlparser/v2/gqlerror"
+	"github.com/vektah/gqlparser/v2/parser"
+	"github.com/vektah/gqlparser/v2/validator"
 )
 
 // A Handler can produce valid GraphQL and Dgraph schemas given an input of
@@ -133,6 +134,7 @@ func NewHandler(input string) (Handler, error) {
 	}
 
 	dgSchema := genDgSchema(sch, defns)
+
 	completeSchema(sch, defns)
 
 	return &handler{
@@ -167,32 +169,75 @@ func typeName(def *ast.Definition) string {
 }
 
 // fieldName returns the dgraph predicate corresponding to a field.
-// If the field had a dgraph directive, then it returns the value of the name field otherwise
+// If the field had a dgraph directive, then it returns the value of the pred arg otherwise
 // it returns typeName + "." + fieldName.
 func fieldName(def *ast.FieldDefinition, typName string) string {
-	name := typName + "." + def.Name
-	dir := def.Directives.ForName(dgraphDirective)
-	if dir == nil {
-		return name
-	}
-	predArg := dir.Arguments.ForName(dgraphPredArg)
+	predArg := getDgraphDirPredArg(def)
 	if predArg == nil {
-		return name
+		return typName + "." + def.Name
 	}
 	return predArg.Value.Raw
+}
+
+func getDgraphDirPredArg(def *ast.FieldDefinition) *ast.Argument {
+	dir := def.Directives.ForName(dgraphDirective)
+	if dir == nil {
+		return nil
+	}
+	predArg := dir.Arguments.ForName(dgraphPredArg)
+	return predArg
 }
 
 // genDgSchema generates Dgraph schema from a valid graphql schema.
 func genDgSchema(gqlSch *ast.Schema, definitions []string) string {
 	var typeStrings []string
 
+	type dgPred struct {
+		typ     string
+		indexes map[string]bool
+		upsert  string
+		reverse string
+	}
+
+	type field struct {
+		name string
+		// true if the field was inherited from an interface, we don't add the predicate schema
+		// for it then as the it would already have been added with the interface.
+		inherited bool
+	}
+
+	type dgType struct {
+		name   string
+		fields []field
+	}
+
+	dgTypes := make([]dgType, 0, len(definitions))
+	dgPreds := make(map[string]dgPred)
+
+	getUpdatedPred := func(fname, typStr, upsertStr string, indexes []string) dgPred {
+		pred, ok := dgPreds[fname]
+		if !ok {
+			pred = dgPred{
+				typ:     typStr,
+				indexes: make(map[string]bool),
+				upsert:  upsertStr,
+			}
+		}
+		for _, index := range indexes {
+			pred.indexes[index] = true
+		}
+		return pred
+	}
+
 	for _, key := range definitions {
 		def := gqlSch.Types[key]
 		switch def.Kind {
 		case ast.Object, ast.Interface:
 			typName := typeName(def)
-			var typeDef, preds strings.Builder
-			fmt.Fprintf(&typeDef, "type %s {\n", typName)
+
+			typ := dgType{name: typName}
+			pwdField := getPasswordField(def)
+
 			for _, f := range def.Fields {
 				if f.Type.Name() == "ID" {
 					continue
@@ -219,66 +264,112 @@ func genDgSchema(gqlSch *ast.Schema, definitions []string) string {
 				case ast.Object:
 					typStr = fmt.Sprintf("%suid%s", prefix, suffix)
 
-					fmt.Fprintf(&typeDef, "  %s: %s\n", fname, typStr)
 					if parentInt == nil {
-						fmt.Fprintf(&preds, "%s: %s .\n", fname, typStr)
+						if strings.HasPrefix(fname, "~") {
+							// remove ~
+							forwardEdge := fname[1:]
+							forwardPred := dgPreds[forwardEdge]
+							forwardPred.reverse = "@reverse "
+							dgPreds[forwardEdge] = forwardPred
+						} else {
+							pred := dgPreds[fname]
+							pred.typ = typStr
+							dgPreds[fname] = pred
+						}
 					}
+					typ.fields = append(typ.fields, field{fname, parentInt != nil})
 				case ast.Scalar:
 					typStr = fmt.Sprintf(
 						"%s%s%s",
 						prefix, scalarToDgraph[f.Type.Name()], suffix,
 					)
 
-					indexStr := ""
+					var indexes []string
 					upsertStr := ""
 					search := f.Directives.ForName(searchDirective)
 					id := f.Directives.ForName(idDirective)
 					if id != nil {
 						upsertStr = "@upsert "
+						indexes = append(indexes, "hash")
 					}
 
 					if search != nil {
 						arg := search.Arguments.ForName(searchArgs)
 						if arg != nil {
-							indexes := getAllSearchIndexes(arg.Value)
-							indexes = addHashIfRequired(f, indexes)
-							indexStr = fmt.Sprintf(" @index(%s)", strings.Join(indexes, ", "))
+							indexes = append(indexes, getAllSearchIndexes(arg.Value)...)
 						} else {
-							indexStr = fmt.Sprintf(" @index(%s)", defaultSearches[f.Type.Name()])
+							indexes = append(indexes, defaultSearches[f.Type.Name()])
 						}
-					} else if id != nil {
-						indexStr = fmt.Sprintf(" @index(hash)")
 					}
 
-					fmt.Fprintf(&typeDef, "  %s: %s\n", fname, typStr)
 					if parentInt == nil {
-						fmt.Fprintf(&preds, "%s: %s%s %s.\n", fname, typStr, indexStr, upsertStr)
+						dgPreds[fname] = getUpdatedPred(fname, typStr, upsertStr, indexes)
 					}
+					typ.fields = append(typ.fields, field{fname, parentInt != nil})
 				case ast.Enum:
 					typStr = fmt.Sprintf("%s%s%s", prefix, "string", suffix)
 
-					indexStr := " @index(hash)"
+					indexes := []string{"hash"}
 					search := f.Directives.ForName(searchDirective)
 					if search != nil {
 						arg := search.Arguments.ForName(searchArgs)
 						if arg != nil {
-							indexes := getAllSearchIndexes(arg.Value)
-							indexStr = fmt.Sprintf(" @index(%s)", strings.Join(indexes, ", "))
+							indexes = getAllSearchIndexes(arg.Value)
 						}
 					}
-					fmt.Fprintf(&typeDef, "  %s: %s\n", fname, typStr)
 					if parentInt == nil {
-						fmt.Fprintf(&preds, "%s: %s%s .\n", fname, typStr, indexStr)
+						dgPreds[fname] = getUpdatedPred(fname, typStr, "", indexes)
 					}
+					typ.fields = append(typ.fields, field{fname, parentInt != nil})
 				}
 			}
-			fmt.Fprintf(&typeDef, "}\n")
+			if pwdField != nil {
+				parentInt := parentInterfaceForPwdField(gqlSch, def, pwdField.Name)
+				if parentInt != nil {
+					typName = typeName(parentInt)
+				}
+				fname := fieldName(pwdField, typName)
 
-			typeStrings = append(
-				typeStrings,
-				fmt.Sprintf("%s%s", typeDef.String(), preds.String()),
-			)
+				if parentInt == nil {
+					dgPreds[fname] = dgPred{typ: "password"}
+				}
+
+				typ.fields = append(typ.fields, field{fname, parentInt != nil})
+			}
+			dgTypes = append(dgTypes, typ)
 		}
+	}
+
+	predWritten := make(map[string]bool, len(dgPreds))
+	for _, typ := range dgTypes {
+		var typeDef, preds strings.Builder
+		fmt.Fprintf(&typeDef, "type %s {\n", typ.name)
+		for _, fld := range typ.fields {
+			f, ok := dgPreds[fld.name]
+			if !ok {
+				continue
+			}
+			fmt.Fprintf(&typeDef, "  %s\n", fld.name)
+			if !fld.inherited && !predWritten[fld.name] {
+				indexStr := ""
+				if len(f.indexes) > 0 {
+					indexes := make([]string, 0)
+					for index := range f.indexes {
+						indexes = append(indexes, index)
+					}
+					sort.Strings(indexes)
+					indexStr = fmt.Sprintf(" @index(%s)", strings.Join(indexes, ", "))
+				}
+				fmt.Fprintf(&preds, "%s: %s%s %s%s.\n", fld.name, f.typ, indexStr, f.upsert,
+					f.reverse)
+				predWritten[fld.name] = true
+			}
+		}
+		fmt.Fprintf(&typeDef, "}\n")
+		typeStrings = append(
+			typeStrings,
+			fmt.Sprintf("%s%s", typeDef.String(), preds.String()),
+		)
 	}
 
 	return strings.Join(typeStrings, "")
