@@ -66,6 +66,7 @@ type options struct {
 
 	MapShards    int
 	ReduceShards int
+	XidShards    int
 
 	shardOutputDirs []string
 
@@ -169,7 +170,7 @@ func readSchema(opt *options) *schema.ParsedSchema {
 
 func (ld *loader) mapStage() {
 	ld.prog.setPhase(mapPhase)
-	ld.xids = xidmap.New(ld.zero, nil)
+	ld.xids = xidmap.New(ld.zero, nil, ld.opt.XidShards, false)
 
 	files := x.FindDataFiles(ld.opt.DataFiles, []string{".rdf", ".rdf.gz", ".json", ".json.gz"})
 	if len(files) == 0 {

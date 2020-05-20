@@ -68,6 +68,7 @@ type options struct {
 	verbose        bool
 	httpAddr       string
 	bufferSize     int
+	XidShards      int
 }
 
 type predicate struct {
@@ -149,7 +150,8 @@ func init() {
 	flag.StringP("user", "u", "", "Username if login is required.")
 	flag.StringP("password", "p", "", "Password of the user.")
 	flag.StringP("bufferSize", "m", "100", "Buffer for each thread")
-
+	flag.Int("xid_shards", 32,
+		"Ignore UIDs in load files and assign new ones.")
 	// TLS configuration
 	x.RegisterClientTLSFlags(flag)
 }
@@ -378,7 +380,7 @@ func setup(opts batchMutationOptions, dc *dgo.Dgraph) *loader {
 	connzero, err := x.SetupConnection(opt.zero, nil, false)
 	x.Checkf(err, "Unable to connect to zero, Is it running at %s?", opt.zero)
 
-	alloc := xidmap.New(connzero, db)
+	alloc := xidmap.New(connzero, db, opt.XidShards, false)
 	l := &loader{
 		opts:      opts,
 		dc:        dc,

@@ -99,6 +99,8 @@ func init() {
 		"Comma separated list of tokenizer plugins")
 	flag.Bool("new_uids", false,
 		"Ignore UIDs in load files and assign new ones.")
+	flag.Int("xid_shards", 32,
+		"Ignore UIDs in load files and assign new ones.")
 
 	// Options around how to set up Badger.
 	flag.String("encryption_key_file", "",
@@ -136,6 +138,7 @@ func run() {
 
 		BadgerKeyFile:          Bulk.Conf.GetString("encryption_key_file"),
 		BadgerCompressionLevel: Bulk.Conf.GetInt("badger.compression_level"),
+		XidShards:              Bulk.Conf.GetInt("xid_shards"),
 	}
 
 	x.PrintVersion()
