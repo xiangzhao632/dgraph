@@ -177,40 +177,28 @@ func newMapIterator(filename string) *mapIterator {
 	return &mapIterator{fd: fd, reader: bufio.NewReaderSize(gzReader, 16<<10)}
 }
 
+func (r *reducer) streamIdFor(pred string) uint32 {
+	r.mu.RLock()
+	if id, ok := r.streamIds[pred]; ok {
+		r.mu.RUnlock()
+		return id
+	}
+	r.mu.RUnlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if id, ok := r.streamIds[pred]; ok {
+		return id
+	}
+	streamId := atomic.AddUint32(&r.streamId, 1)
+	r.streamIds[pred] = streamId
+	return streamId
+}
+
 func (r *reducer) encodeAndWrite(writer *badger.StreamWriter, entryCh chan []*pb.MapEntry, closer *y.Closer) {
 	defer closer.Done()
 
 	var listSize int
 	list := &bpb.KVList{}
-
-	preds := make(map[string]uint32)
-	setStreamId := func(kv *bpb.KV) {
-		pk, err := x.Parse(kv.Key)
-		x.Check(err)
-		x.AssertTrue(len(pk.Attr) > 0)
-
-		// We don't need to consider the data prefix, count prefix, etc. because each predicate
-		// contains sorted keys, the way they are produced.
-		streamId := preds[pk.Attr]
-		if streamId == 0 {
-			streamId = atomic.AddUint32(&r.streamId, 1)
-			preds[pk.Attr] = streamId
-		}
-
-		kv.StreamId = streamId
-	}
-
-	// Once we have processed all records from single stream, we can mark that stream as done.
-	// This will close underlying table builder in Badger for stream. Since we preallocate 1 MB
-	// of memory for each table builder, this can result in memory saving in case we have large
-	// number of streams.
-	// This change limits maximum number of open streams to number of streams created in a single
-	// write call. This can also be optimised if required.
-	addDone := func(doneSteams []uint32, l *bpb.KVList) {
-		for _, streamId := range doneSteams {
-			l.Kv = append(l.Kv, &bpb.KV{StreamId: streamId, StreamDone: true})
-		}
-	}
 	//Since a batch doesn't always include all mapEntries with the same key. kvBuilder is needed
 	//to save in building kv.
 	kvb := &kvBuilder{
@@ -219,21 +207,19 @@ func (r *reducer) encodeAndWrite(writer *badger.StreamWriter, entryCh chan []*pb
 		pl:         new(pb.PostingList),
 		finish:     false,
 	}
-	var doneStreams []uint32
-	var prevSID uint32
 	for batch := range entryCh {
 		listSize += r.toList(batch, list, kvb)
 		if listSize > 4<<20 {
 			for _, kv := range list.Kv {
-				setStreamId(kv)
-				if prevSID != 0 && (prevSID != kv.StreamId) {
-					doneStreams = append(doneStreams, prevSID)
+				pk, err := x.Parse(kv.Key)
+				x.Check(err)
+				x.AssertTrue(len(pk.Attr) > 0)
+				kv.StreamId = r.streamIdFor(pk.Attr)
+				if pk.HasStartUid {
+					kv.StreamId |= 0x80000000
 				}
-				prevSID = kv.StreamId
 			}
-			addDone(doneStreams, list)
 			x.Check(writer.Write(list))
-			doneStreams = doneStreams[:0]
 			list = &bpb.KVList{}
 			listSize = 0
 		}
@@ -242,7 +228,13 @@ func (r *reducer) encodeAndWrite(writer *badger.StreamWriter, entryCh chan []*pb
 	r.toList(nil, list, kvb)
 	if len(list.Kv) > 0 {
 		for _, kv := range list.Kv {
-			setStreamId(kv)
+			pk, err := x.Parse(kv.Key)
+			x.Check(err)
+			x.AssertTrue(len(pk.Attr) > 0)
+			kv.StreamId = r.streamIdFor(pk.Attr)
+			if pk.HasStartUid {
+				kv.StreamId |= 0x80000000
+			}
 		}
 		x.Check(writer.Write(list))
 	}
