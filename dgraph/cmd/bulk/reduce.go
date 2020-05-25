@@ -207,6 +207,21 @@ func (r *reducer) encodeAndWrite(writer *badger.StreamWriter, entryCh chan []*pb
 		pl:         new(pb.PostingList),
 		finish:     false,
 	}
+
+	// Once we have processed all records from single stream, we can mark that stream as done.
+	// This will close underlying table builder in Badger for stream. Since we preallocate 1 MB
+	// of memory for each table builder, this can result in memory saving in case we have large
+	// number of streams.
+	// This change limits maximum number of open streams to number of streams created in a single
+	// write call. This can also be optimised if required.
+	addDone := func(doneSteams map[uint32]struct{}, l *bpb.KVList) {
+		for streamId := range doneSteams {
+			l.Kv = append(l.Kv, &bpb.KV{StreamId: streamId, StreamDone: true})
+		}
+	}
+
+	doneStreams := map[uint32]struct{}{}
+	var prevPred string
 	for batch := range entryCh {
 		listSize += r.toList(batch, list, kvb)
 		if listSize > 4<<20 {
@@ -214,10 +229,16 @@ func (r *reducer) encodeAndWrite(writer *badger.StreamWriter, entryCh chan []*pb
 				pk, err := x.Parse(kv.Key)
 				x.Check(err)
 				x.AssertTrue(len(pk.Attr) > 0)
+				if prevPred != "" && (prevPred != pk.Attr) {
+					addDone(doneStreams, list)
+					doneStreams = map[uint32]struct{}{}
+				}
+				prevPred = pk.Attr
 				kv.StreamId = r.streamIdFor(pk.Attr)
 				if pk.HasStartUid {
 					kv.StreamId |= 0x80000000
 				}
+				doneStreams[kv.StreamId] = struct{}{}
 			}
 			x.Check(writer.Write(list))
 			list = &bpb.KVList{}
