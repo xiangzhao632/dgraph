@@ -69,6 +69,7 @@ type options struct {
 	httpAddr       string
 	bufferSize     int
 	ludicrousMode  bool
+	XidShards      int
 }
 
 type predicate struct {
@@ -151,7 +152,8 @@ func init() {
 	flag.StringP("password", "p", "", "Password of the user.")
 	flag.StringP("bufferSize", "m", "100", "Buffer for each thread")
 	flag.Bool("ludicrous_mode", false, "Run live loader in ludicrous mode (Should only be done when alpha is under ludicrous mode)")
-
+	flag.Int("xid_shards", 32,
+		"Ignore UIDs in load files and assign new ones.")
 	// TLS configuration
 	x.RegisterClientTLSFlags(flag)
 }
@@ -382,7 +384,7 @@ func setup(opts batchMutationOptions, dc *dgo.Dgraph) *loader {
 	connzero, err := x.SetupConnection(opt.zero, nil, false)
 	x.Checkf(err, "Unable to connect to zero, Is it running at %s?", opt.zero)
 
-	alloc := xidmap.New(connzero, db)
+	alloc := xidmap.New(connzero, db, opt.XidShards, false)
 	l := &loader{
 		opts:      opts,
 		dc:        dc,
