@@ -20,12 +20,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io/ioutil"
+	"net/http"
+	"strings"
 	"sync"
+	"time"
 
+	"github.com/dgraph-io/dgraph/edgraph"
 	"github.com/dgraph-io/dgraph/graphql/dgraph"
 
-	dgoapi "github.com/dgraph-io/dgo/v2/protos/api"
-	"github.com/dgraph-io/dgraph/gql"
+	dgoapi "github.com/dgraph-io/dgo/v200/protos/api"
 	"github.com/dgraph-io/dgraph/graphql/api"
 	"github.com/dgraph-io/dgraph/x"
 	"github.com/pkg/errors"
@@ -50,12 +54,12 @@ type ResolverFactory interface {
 	mutationResolverFor(mutation schema.Mutation) MutationResolver
 
 	// WithQueryResolver adds a new query resolver.  Each time query name is resolved
-	// resolver is called to create a new instane of a QueryResolver to resolve the
+	// resolver is called to create a new instance of a QueryResolver to resolve the
 	// query.
 	WithQueryResolver(name string, resolver func(schema.Query) QueryResolver) ResolverFactory
 
 	// WithMutationResolver adds a new query resolver.  Each time mutation name is resolved
-	// resolver is called to create a new instane of a MutationResolver to resolve the
+	// resolver is called to create a new instance of a MutationResolver to resolve the
 	// mutation.
 	WithMutationResolver(
 		name string, resolver func(schema.Mutation) MutationResolver) ResolverFactory
@@ -63,6 +67,15 @@ type ResolverFactory interface {
 	// WithConventionResolvers adds a set of our convention based resolvers to the
 	// factory.  The registration happens only once.
 	WithConventionResolvers(s schema.Schema, fns *ResolverFns) ResolverFactory
+
+	// WithQueryMiddlewareConfig adds the configuration to use to apply middlewares before resolving
+	// queries. The config should be a mapping of the name of query to its middlewares.
+	WithQueryMiddlewareConfig(config map[string]QueryMiddlewares) ResolverFactory
+
+	// WithMutationMiddlewareConfig adds the configuration to use to apply middlewares before
+	// resolving mutations. The config should be a mapping of the name of mutation to its
+	// middlewares.
+	WithMutationMiddlewareConfig(config map[string]MutationMiddlewares) ResolverFactory
 
 	// WithSchemaIntrospection adds schema introspection capabilities to the factory.
 	// So __schema and __type queries can be resolved.
@@ -73,10 +86,13 @@ type ResolverFactory interface {
 // in resolving field and applies a completion step - for example, apply GraphQL
 // error propagation or massaging error paths.
 type ResultCompleter interface {
-	Complete(ctx context.Context, field schema.Field, result []byte, err error) ([]byte, error)
+	Complete(ctx context.Context, resolved *Resolved)
 }
 
 // RequestResolver can process GraphQL requests and write GraphQL JSON responses.
+// A schema.Request may contain any number of queries or mutations (never both).
+// RequestResolver.Resolve() resolves all of them by finding the resolved answers
+// of the component queries/mutations and joining into a single schema.Response.
 type RequestResolver struct {
 	schema    schema.Schema
 	resolvers ResolverFactory
@@ -90,6 +106,9 @@ type resolverFactory struct {
 	queryResolvers    map[string]func(schema.Query) QueryResolver
 	mutationResolvers map[string]func(schema.Mutation) MutationResolver
 
+	queryMiddlewareConfig    map[string]QueryMiddlewares
+	mutationMiddlewareConfig map[string]MutationMiddlewares
+
 	// returned if the factory gets asked for resolver for a field that it doesn't
 	// know about.
 	queryError    QueryResolverFunc
@@ -102,58 +121,71 @@ type ResolverFns struct {
 	Arw func() MutationRewriter
 	Urw func() MutationRewriter
 	Drw MutationRewriter
-	Qe  QueryExecutor
-	Me  MutationExecutor
+	Ex  DgraphExecutor
 }
 
 // dgraphExecutor is an implementation of both QueryExecutor and MutationExecutor
 // that proxies query/mutation resolution through Query method in dgraph server.
 type dgraphExecutor struct {
+	dg *dgraph.DgraphEx
 }
 
-// A Resolved is the result of resolving a single query or mutation.
-// A schema.Request may contain any number of queries or mutations (never both).
-// RequestResolver.Resolve() resolves all of them by finding the resolved answers
-// of the component queries/mutations and joining into a single schema.Response.
+// adminExecutor is an implementation of both QueryExecutor and MutationExecutor
+// that proxies query resolution through Query method in dgraph server, and
+// it doesn't require authorization. Currently it's only used for querying
+// gqlschema during init.
+type adminExecutor struct {
+	dg *dgraph.DgraphEx
+}
+
+// A Resolved is the result of resolving a single field - generally a query or mutation.
 type Resolved struct {
-	Data []byte
-	Err  error
+	Data       interface{}
+	Field      schema.Field
+	Err        error
+	Extensions *schema.Extensions
 }
 
 // CompletionFunc is an adapter that allows us to compose completions and build a
 // ResultCompleter from a function.  Based on the http.HandlerFunc pattern.
-type CompletionFunc func(
-	ctx context.Context, field schema.Field, result []byte, err error) ([]byte, error)
+type CompletionFunc func(ctx context.Context, resolved *Resolved)
 
-// Complete calls cf(ctx, field, result, err)
-func (cf CompletionFunc) Complete(
-	ctx context.Context,
-	field schema.Field,
-	result []byte,
-	err error) ([]byte, error) {
-
-	return cf(ctx, field, result, err)
+// Complete calls cf(ctx, resolved)
+func (cf CompletionFunc) Complete(ctx context.Context, resolved *Resolved) {
+	cf(ctx, resolved)
 }
 
-// DgraphAsQueryExecutor builds a QueryExecutor for proxying requests through dgraph.
-func DgraphAsQueryExecutor() QueryExecutor {
-	return &dgraphExecutor{}
+// NewDgraphExecutor builds a DgraphExecutor for proxying requests through dgraph.
+func NewDgraphExecutor() DgraphExecutor {
+	return newDgraphExecutor(&dgraph.DgraphEx{})
 }
 
-// DgraphAsMutationExecutor builds a MutationExecutor for dog.
-func DgraphAsMutationExecutor() MutationExecutor {
-	return &dgraphExecutor{}
+func newDgraphExecutor(dg *dgraph.DgraphEx) DgraphExecutor {
+	return &dgraphExecutor{dg: dg}
 }
 
-func (de *dgraphExecutor) Query(ctx context.Context, query *gql.GraphQuery) ([]byte, error) {
-	return dgraph.Query(ctx, query)
+// NewAdminExecutor builds a DgraphExecutor for proxying requests through dgraph.
+func NewAdminExecutor() DgraphExecutor {
+	return &adminExecutor{dg: &dgraph.DgraphEx{}}
 }
 
-func (de *dgraphExecutor) Mutate(
-	ctx context.Context,
-	query *gql.GraphQuery,
-	mutations []*dgoapi.Mutation) (map[string]string, map[string]interface{}, error) {
-	return dgraph.Mutate(ctx, query, mutations)
+func (aex *adminExecutor) Execute(ctx context.Context, req *dgoapi.Request) (
+	*dgoapi.Response, error) {
+	ctx = context.WithValue(ctx, edgraph.Authorize, false)
+	return aex.dg.Execute(ctx, req)
+}
+
+func (aex *adminExecutor) CommitOrAbort(ctx context.Context, tc *dgoapi.TxnContext) error {
+	return aex.dg.CommitOrAbort(ctx, tc)
+}
+
+func (de *dgraphExecutor) Execute(ctx context.Context, req *dgoapi.Request) (
+	*dgoapi.Response, error) {
+	return de.dg.Execute(ctx, req)
+}
+
+func (de *dgraphExecutor) CommitOrAbort(ctx context.Context, tc *dgoapi.TxnContext) error {
+	return de.dg.CommitOrAbort(ctx, tc)
 }
 
 func (rf *resolverFactory) WithQueryResolver(
@@ -169,51 +201,80 @@ func (rf *resolverFactory) WithMutationResolver(
 }
 
 func (rf *resolverFactory) WithSchemaIntrospection() ResolverFactory {
-	introspect := func(q schema.Query) QueryResolver {
-		return &queryResolver{
-			queryRewriter:   NoOpQueryRewrite(),
-			queryExecutor:   introspectionExecution(q),
-			resultCompleter: removeObjectCompletion(noopCompletion),
-		}
-	}
-
-	rf.WithQueryResolver("__schema", introspect)
-	rf.WithQueryResolver("__type", introspect)
-
-	return rf
+	return rf.
+		WithQueryResolver("__schema",
+			func(q schema.Query) QueryResolver {
+				return QueryResolverFunc(resolveIntrospection)
+			}).
+		WithQueryResolver("__type",
+			func(q schema.Query) QueryResolver {
+				return QueryResolverFunc(resolveIntrospection)
+			})
 }
 
 func (rf *resolverFactory) WithConventionResolvers(
 	s schema.Schema, fns *ResolverFns) ResolverFactory {
 
 	queries := append(s.Queries(schema.GetQuery), s.Queries(schema.FilterQuery)...)
+	queries = append(queries, s.Queries(schema.PasswordQuery)...)
 	for _, q := range queries {
 		rf.WithQueryResolver(q, func(q schema.Query) QueryResolver {
-			return NewQueryResolver(fns.Qrw, fns.Qe, StdQueryCompletion())
+			return NewQueryResolver(fns.Qrw, fns.Ex, StdQueryCompletion())
+		})
+	}
+
+	for _, q := range s.Queries(schema.HTTPQuery) {
+		rf.WithQueryResolver(q, func(q schema.Query) QueryResolver {
+			return NewHTTPQueryResolver(&http.Client{
+				// TODO - This can be part of a config later.
+				Timeout: time.Minute,
+			}, StdQueryCompletion())
 		})
 	}
 
 	for _, m := range s.Mutations(schema.AddMutation) {
 		rf.WithMutationResolver(m, func(m schema.Mutation) MutationResolver {
-			return NewMutationResolver(
-				fns.Arw(), fns.Qe, fns.Me, StdMutationCompletion(m.ResponseName()))
+			return NewDgraphResolver(fns.Arw(), fns.Ex, StdMutationCompletion(m.Name()))
 		})
 	}
 
 	for _, m := range s.Mutations(schema.UpdateMutation) {
 		rf.WithMutationResolver(m, func(m schema.Mutation) MutationResolver {
-			return NewMutationResolver(
-				fns.Urw(), fns.Qe, fns.Me, StdMutationCompletion(m.ResponseName()))
+			return NewDgraphResolver(fns.Urw(), fns.Ex, StdMutationCompletion(m.Name()))
 		})
 	}
 
 	for _, m := range s.Mutations(schema.DeleteMutation) {
 		rf.WithMutationResolver(m, func(m schema.Mutation) MutationResolver {
-			return NewMutationResolver(
-				fns.Drw, NoOpQueryExecution(), fns.Me, StdDeleteCompletion(m.ResponseName()))
+			return NewDgraphResolver(fns.Drw, fns.Ex, deleteCompletion())
 		})
 	}
 
+	for _, m := range s.Mutations(schema.HTTPMutation) {
+		rf.WithMutationResolver(m, func(m schema.Mutation) MutationResolver {
+			return NewHTTPMutationResolver(&http.Client{
+				// TODO - This can be part of a config later.
+				Timeout: time.Minute,
+			}, StdQueryCompletion())
+		})
+	}
+
+	return rf
+}
+
+func (rf *resolverFactory) WithQueryMiddlewareConfig(
+	config map[string]QueryMiddlewares) ResolverFactory {
+	if len(config) != 0 {
+		rf.queryMiddlewareConfig = config
+	}
+	return rf
+}
+
+func (rf *resolverFactory) WithMutationMiddlewareConfig(
+	config map[string]MutationMiddlewares) ResolverFactory {
+	if len(config) != 0 {
+		rf.mutationMiddlewareConfig = config
+	}
 	return rf
 }
 
@@ -228,6 +289,9 @@ func NewResolverFactory(
 		queryResolvers:    make(map[string]func(schema.Query) QueryResolver),
 		mutationResolvers: make(map[string]func(schema.Mutation) MutationResolver),
 
+		queryMiddlewareConfig:    make(map[string]QueryMiddlewares),
+		mutationMiddlewareConfig: make(map[string]MutationMiddlewares),
+
 		queryError:    queryError,
 		mutationError: mutationError,
 	}
@@ -235,30 +299,32 @@ func NewResolverFactory(
 
 // StdQueryCompletion is the completion steps that get run for queries
 func StdQueryCompletion() CompletionFunc {
-	return removeObjectCompletion(completeDgraphResult)
+	return noopCompletion
 }
 
 // StdMutationCompletion is the completion steps that get run for add and update mutations
 func StdMutationCompletion(name string) CompletionFunc {
-	return addPathCompletion(name, addRootFieldCompletion(name, completeDgraphResult))
+	return noopCompletion
 }
 
-// StdDeleteCompletion is the completion steps that get run for add and update mutations
+// StdDeleteCompletion is the completion steps that get run for delete mutations
 func StdDeleteCompletion(name string) CompletionFunc {
-	return addPathCompletion(name, addRootFieldCompletion(name, deleteCompletion()))
+	return deleteCompletion()
 }
 
 func (rf *resolverFactory) queryResolverFor(query schema.Query) QueryResolver {
+	mws := rf.queryMiddlewareConfig[query.Name()]
 	if resolver, ok := rf.queryResolvers[query.Name()]; ok {
-		return resolver(query)
+		return mws.Then(resolver(query))
 	}
 
 	return rf.queryError
 }
 
 func (rf *resolverFactory) mutationResolverFor(mutation schema.Mutation) MutationResolver {
+	mws := rf.mutationMiddlewareConfig[mutation.Name()]
 	if resolver, ok := rf.mutationResolvers[mutation.Name()]; ok {
-		return resolver(mutation)
+		return mws.Then(resolver(mutation))
 	}
 
 	return rf.mutationError
@@ -281,45 +347,39 @@ func (r *RequestResolver) Resolve(ctx context.Context, gqlReq *schema.Request) *
 	stop := x.SpanTimer(span, methodResolve)
 	defer stop()
 
-	reqID := api.RequestID(ctx)
-
 	if r == nil {
-		glog.Errorf("[%s] Call to Resolve with nil RequestResolver", reqID)
-		return schema.ErrorResponse(errors.New("Internal error"), reqID)
+		glog.Errorf("Call to Resolve with nil RequestResolver")
+		return schema.ErrorResponse(errors.New("Internal error"))
 	}
 
 	if r.schema == nil {
-		glog.Errorf("[%s] Call to Resolve with no schema", reqID)
-		return schema.ErrorResponse(errors.New("Internal error"), reqID)
+		glog.Errorf("Call to Resolve with no schema")
+		return schema.ErrorResponse(errors.New("Internal error"))
 	}
 
 	op, err := r.schema.Operation(gqlReq)
 	if err != nil {
-		return schema.ErrorResponse(err, reqID)
+		return schema.ErrorResponse(err)
 	}
 
-	resp := &schema.Response{
-		Extensions: &schema.Extensions{
-			RequestID: reqID,
-		},
-	}
+	resp := &schema.Response{}
 
 	if glog.V(3) {
-		b, err := json.Marshal(gqlReq.Variables)
-		if err != nil {
-			glog.Infof("Failed to marshal variables for logging : %s", err)
+		// don't log the introspection queries they are sent too frequently
+		// by GraphQL dev tools
+		if !op.IsQuery() ||
+			(op.IsQuery() && !strings.HasPrefix(op.Queries()[0].Name(), "__")) {
+			b, err := json.Marshal(gqlReq.Variables)
+			if err != nil {
+				glog.Infof("Failed to marshal variables for logging : %s", err)
+			}
+			glog.Infof("Resolving GQL request: \n%s\nWith Variables: \n%s\n",
+				gqlReq.Query, string(b))
 		}
-		glog.Infof("[%s] Resolving GQL request: \n%s\nWith Variables: \n%s\n",
-			reqID, gqlReq.Query, string(b))
 	}
 
-	// A single request can contain either queries or mutations - not both.
-	// GraphQL validation on the request would have caught that error case
-	// before we get here.  At this point, we know it's valid, it's passed
-	// GraphQL validation and any additional validation we've added.  So here,
-	// we can just execute it.
-	switch {
-	case op.IsQuery():
+	// resolveQueries will resolve user's queries.
+	resolveQueries := func() {
 		// Queries run in parallel and are independent of each other: e.g.
 		// an error in one query, doesn't affect the others.
 
@@ -331,9 +391,12 @@ func (r *RequestResolver) Resolve(ctx context.Context, gqlReq *schema.Request) *
 
 			go func(q schema.Query, storeAt int) {
 				defer wg.Done()
-				defer api.PanicHandler(api.RequestID(ctx),
+				defer api.PanicHandler(
 					func(err error) {
-						allResolved[storeAt] = &Resolved{Err: err}
+						allResolved[storeAt] = &Resolved{
+							Data:  nil,
+							Field: q,
+							Err:   err}
 					})
 
 				allResolved[storeAt] = r.resolvers.queryResolverFor(q).Resolve(ctx, q)
@@ -346,9 +409,17 @@ func (r *RequestResolver) Resolve(ctx context.Context, gqlReq *schema.Request) *
 		for _, res := range allResolved {
 			// Errors and data in the same response is valid.  Both WithError and
 			// AddData handle nil cases.
-			resp.WithError(res.Err)
-			resp.AddData(res.Data)
+			addResult(resp, res)
 		}
+	}
+	// A single request can contain either queries or mutations - not both.
+	// GraphQL validation on the request would have caught that error case
+	// before we get here.  At this point, we know it's valid, it's passed
+	// GraphQL validation and any additional validation we've added.  So here,
+	// we can just execute it.
+	switch {
+	case op.IsQuery():
+		resolveQueries()
 	case op.IsMutation():
 		// A mutation operation can contain any number of mutation fields.  Those should be executed
 		// serially.
@@ -376,97 +447,75 @@ func (r *RequestResolver) Resolve(ctx context.Context, gqlReq *schema.Request) *
 
 			var res *Resolved
 			res, allSuccessful = r.resolvers.mutationResolverFor(m).Resolve(ctx, m)
-			resp.WithError(res.Err)
-			resp.AddData(res.Data)
+			addResult(resp, res)
 		}
 	case op.IsSubscription():
-		resp.WithError(errors.Errorf("Subscriptions not yet supported."))
+		resolveQueries()
 	}
 
 	return resp
 }
 
+// ValidateSubscription will check the given subscription query is valid or not.
+func (r *RequestResolver) ValidateSubscription(req *schema.Request) error {
+	return errors.New("Subscriptions are not supported")
+	op, err := r.schema.Operation(req)
+	if err != nil {
+		return err
+	}
+
+	for _, q := range op.Queries() {
+		for _, field := range q.SelectionSet() {
+			if err := validateCustomFieldsRecursively(field); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// validateCustomFieldsRecursively will return err if the given field is custom or any of its
+// children is type of a custom field.
+func validateCustomFieldsRecursively(field schema.Field) error {
+	if has, _ := field.HasCustomDirective(); has {
+		return x.GqlErrorf("Custom field `%s` is not supported in graphql subscription",
+			field.Name()).WithLocations(field.Location())
+	}
+	for _, f := range field.SelectionSet() {
+		err := validateCustomFieldsRecursively(f)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func addResult(resp *schema.Response, res *Resolved) {
+	// Errors should report the "path" into the result where the error was found.
+	//
+	// The definition of a path in a GraphQL error is here:
+	// https://graphql.github.io/graphql-spec/June2018/#sec-Errors
+	// For a query like (assuming field f is of a list type and g is a scalar type):
+	// - q { f { g } }
+	// a path to the 2nd item in the f list would look like:
+	// - [ "q", "f", 2, "g" ]
+	path := make([]interface{}, 0, maxPathLength(res.Field))
+	var b []byte
+	var gqlErr x.GqlErrorList
+
+	if res.Data != nil {
+		b, gqlErr = completeObject(path, []schema.Field{res.Field},
+			res.Data.(map[string]interface{}))
+	}
+
+	resp.WithError(res.Err)
+	resp.WithError(gqlErr)
+	resp.AddData(b)
+	resp.MergeExtensions(res.Extensions)
+}
+
 // noopCompletion just passes back it's result and err arguments
-func noopCompletion(
-	ctx context.Context, field schema.Field, result []byte, err error) ([]byte, error) {
-	return result, err
-}
-
-// removeObjectCompletion chops leading '{' and trailing '}' from a JSON object
-//
-// The final GraphQL result gets built like
-// { data:
-//    {
-//      q1: {...},
-//      q2: [ {...}, {...} ],
-//      ...
-//    }
-// }
-//
-// When we are building a single one of the q's, the result is built initially as
-// { q1: {...} }
-// so the completed result should be
-// q1: {...}
-func removeObjectCompletion(cf CompletionFunc) CompletionFunc {
-	return CompletionFunc(
-		func(ctx context.Context, field schema.Field, result []byte, err error) ([]byte, error) {
-			res, err := cf(ctx, field, result, err)
-			if len(res) >= 2 {
-				res = res[1 : len(res)-1]
-			}
-			return res, err
-		})
-}
-
-// addRootFieldCompletion adds an extra object name to the start of a result.
-//
-// A mutation always looks like
-//   `addFoo(...) { foo { ... } }`
-// What's resolved initially is
-//   `foo { ... }`
-// So `addFoo: ...` is added.
-func addRootFieldCompletion(name string, cf CompletionFunc) CompletionFunc {
-	return CompletionFunc(func(
-		ctx context.Context, field schema.Field, result []byte, err error) ([]byte, error) {
-
-		res, err := cf(ctx, field, result, err)
-
-		var b bytes.Buffer
-		x.Check2(b.WriteString("\""))
-		x.Check2(b.WriteString(name))
-		x.Check2(b.WriteString(`": `))
-		if len(res) > 0 {
-			x.Check2(b.Write(res))
-		} else {
-			x.Check2(b.WriteString("null"))
-		}
-
-		return b.Bytes(), err
-	})
-}
-
-// addPathCompletion adds an extra object name to the start of every error path
-// arrising from applying cf.
-//
-// A mutation always looks like
-//   `addFoo(...) { foo { ... } }`
-// But cf's error paths begin at `foo`, so `addFoo` needs to be added to all.
-func addPathCompletion(name string, cf CompletionFunc) CompletionFunc {
-	return CompletionFunc(func(
-		ctx context.Context, field schema.Field, result []byte, err error) ([]byte, error) {
-
-		res, err := cf(ctx, field, result, err)
-
-		resErrs := schema.AsGQLErrors(err)
-		for _, err := range resErrs {
-			if len(err.Path) > 0 {
-				err.Path = append([]interface{}{name}, err.Path...)
-			}
-		}
-
-		return res, resErrs
-	})
-}
+func noopCompletion(ctx context.Context, resolved *Resolved) {}
 
 // Once a result has been returned from Dgraph, that result needs to be worked
 // through for two main reasons:
@@ -533,8 +582,12 @@ func addPathCompletion(name string, cf CompletionFunc) CompletionFunc {
 //
 // Returned errors are generally lists of errors resulting from the value completion
 // algorithm that may emit multiple errors
-func completeDgraphResult(ctx context.Context, field schema.Field, dgResult []byte, e error) (
-	[]byte, error) {
+func completeDgraphResult(
+	ctx context.Context,
+	field schema.Field,
+	dgResult []byte,
+	e error) *Resolved {
+
 	span := trace.FromContext(ctx)
 	stop := x.SpanTimer(span, "completeDgraphResult")
 	defer stop()
@@ -550,28 +603,28 @@ func completeDgraphResult(ctx context.Context, field schema.Field, dgResult []by
 	//
 	//    { }  --->  { "q": null }
 
-	errs := schema.AsGQLErrors(e)
-	if len(dgResult) == 0 {
-		return nil, errs
+	nullResponse := func(err error) *Resolved {
+		return &Resolved{
+			Data:  nil,
+			Field: field,
+			Err:   err,
+		}
 	}
 
-	nullResponse := func() []byte {
-		var buf bytes.Buffer
-		x.Check2(buf.WriteString(`{ "`))
-		x.Check2(buf.WriteString(field.ResponseName()))
-		x.Check2(buf.WriteString(`": null }`))
-		return buf.Bytes()
-	}
-
-	dgraphError := func() ([]byte, error) {
-		glog.Errorf("[%s] Could not process Dgraph result : \n%s",
-			api.RequestID(ctx), string(dgResult))
-		return nullResponse(),
+	dgraphError := func() *Resolved {
+		glog.Errorf("Could not process Dgraph result : \n%s", string(dgResult))
+		return nullResponse(
 			x.GqlErrorf("Couldn't process the result from Dgraph.  " +
 				"This probably indicates a bug in the Dgraph GraphQL layer.  " +
 				"Please let us know : https://github.com/dgraph-io/dgraph/issues.").
-				WithLocations(field.Location())
+				WithLocations(field.Location()))
 	}
+
+	if len(dgResult) == 0 {
+		return nullResponse(e)
+	}
+
+	errs := schema.AsGQLErrors(e)
 
 	// Dgraph should only return {} or a JSON object.  Also,
 	// GQL type checking should ensure query results are only object types
@@ -580,15 +633,14 @@ func completeDgraphResult(ctx context.Context, field schema.Field, dgResult []by
 	var valToComplete map[string]interface{}
 	err := json.Unmarshal(dgResult, &valToComplete)
 	if err != nil {
-		glog.Errorf("[%s] %+v \n Dgraph result :\n%s\n",
-			api.RequestID(ctx),
+		glog.Errorf("%+v \n Dgraph result :\n%s\n",
 			errors.Wrap(err, "failed to unmarshal Dgraph query result"),
 			string(dgResult))
-		return nullResponse(),
-			schema.GQLWrapLocationf(err, field.Location(), "couldn't unmarshal Dgraph result")
+		return nullResponse(
+			schema.GQLWrapLocationf(err, field.Location(), "couldn't unmarshal Dgraph result"))
 	}
 
-	switch val := valToComplete[field.ResponseName()].(type) {
+	switch val := valToComplete[field.Name()].(type) {
 	case []interface{}:
 		if field.Type().ListType() == nil {
 			// Turn Dgraph list result to single object
@@ -612,61 +664,498 @@ func completeDgraphResult(ctx context.Context, field schema.Field, dgResult []by
 				//
 				// We'll continue and just try the first item to return some data.
 
-				glog.Errorf("[%s] Got a list of length %v from Dgraph when expecting a "+
-					"one-item list.\n"+
-					"GraphQL query was : %s\n",
-					api.RequestID(ctx), len(val), api.QueryString(ctx))
+				glog.Errorf("Got a list of length %v from Dgraph when expecting a "+
+					"one-item list.\n", len(val))
 
 				errs = append(errs,
 					x.GqlErrorf(
 						"Dgraph returned a list, but %s (type %s) was expecting just one item.  "+
-							"The first item in the list was used to produce the result. "+
-							"Logged as a potential bug; see the API log for more details.",
+							"The first item in the list was used to produce the result.",
 						field.Name(), field.Type().String()).WithLocations(field.Location()))
 			}
 
-			valToComplete[field.ResponseName()] = internalVal
+			valToComplete[field.Name()] = internalVal
 		}
+	case interface{}:
+		// no need to error in this case, this can be returned for custom HTTP query/mutation
 	default:
 		if val != nil {
 			return dgraphError()
 		}
 
-		// valToComplete[field.ResponseName()] is nil, so resolving for the
+		// valToComplete[field.Name()] is nil, so resolving for the
 		// { } ---> "q": null
 		// case
 	}
 
-	// Errors should report the "path" into the result where the error was found.
-	//
-	// The definition of a path in a GraphQL error is here:
-	// https://graphql.github.io/graphql-spec/June2018/#sec-Errors
-	// For a query like (assuming field f is of a list type and g is a scalar type):
-	// - q { f { g } }
-	// a path to the 2nd item in the f list would look like:
-	// - [ "q", "f", 2, "g" ]
-	path := make([]interface{}, 0, maxPathLength(field))
-
-	completed, gqlErrs := completeObject(
-		path, field.Type(), []schema.Field{field}, valToComplete)
-
-	if len(completed) < 2 {
-		// This could only occur completeObject crushed the whole query, but
-		// that should never happen because the result type shouldn't be '!'.
-		// We should wrap enough testing around the schema generation that this
-		// just can't happen.
-		//
-		// This isn't really an observable GraphQL error, so no need to add anything
-		// to the payload of errors for the result.
-		glog.Errorf("[%s] Top level completeObject didn't return a result.  "+
-			"That's only possible if the query result is non-nullable.  "+
-			"There's something wrong in the GraphQL schema.  \n"+
-			"GraphQL query was : %s\n",
-			api.RequestID(ctx), api.QueryString(ctx))
-		return nullResponse(), append(errs, gqlErrs...)
+	err = resolveCustomFields(field.SelectionSet(), valToComplete[field.Name()])
+	if err != nil {
+		errs = append(errs, schema.AsGQLErrors(err)...)
 	}
 
-	return completed, append(errs, gqlErrs...)
+	return &Resolved{
+		Data:  valToComplete,
+		Field: field,
+		Err:   errs,
+	}
+}
+
+func copyTemplate(input interface{}) (interface{}, error) {
+	b, err := json.Marshal(input)
+	if err != nil {
+		return nil, errors.Wrapf(err, "while marshaling map input: %+v", input)
+	}
+
+	var result interface{}
+	if err := json.Unmarshal(b, &result); err != nil {
+		return nil, errors.Wrapf(err, "while unmarshalling into map: %s", b)
+	}
+	return result, nil
+}
+
+func keyNotFoundError(f schema.Field, key string) *x.GqlError {
+	return x.GqlErrorf("Evaluation of custom field failed because key: %s "+
+		"could not be found in the JSON response returned by external request "+
+		"for field: %s within type: %s.", key, f.Name(),
+		f.GetObjectName()).WithLocations(f.Location())
+}
+
+func jsonMarshalError(err error, f schema.Field, input interface{}) *x.GqlError {
+	return x.GqlErrorf("Evaluation of custom field failed because json marshaling "+
+		"(of: %+v) returned an error: %s for field: %s within type: %s.", input, err,
+		f.Name(), f.GetObjectName()).WithLocations(f.Location())
+}
+
+func jsonUnmarshalError(err error, f schema.Field) *x.GqlError {
+	return x.GqlErrorf("Evaluation of custom field failed because json unmarshaling"+
+		" result of external request failed (with error: %s) for field: %s within "+
+		"type: %s.", err, f.Name(), f.GetObjectName()).WithLocations(
+		f.Location())
+}
+
+func externalRequestError(err error, f schema.Field) *x.GqlError {
+	return x.GqlErrorf("Evaluation of custom field failed because external request"+
+		" returned an error: %s for field: %s within type: %s.", err, f.Name(),
+		f.GetObjectName()).WithLocations(f.Location())
+}
+
+func internalServerError(err error, f schema.Field) error {
+	return schema.GQLWrapLocationf(err, f.Location(), "evaluation of custom field failed"+
+		" for field: %s within type: %s.", f.Name(), f.GetObjectName())
+}
+
+type graphqlResp struct {
+	Data   map[string]interface{} `json:"data,omitempty"`
+	Errors x.GqlErrorList         `json:"errors,omitempty"`
+}
+
+func resolveCustomField(f schema.Field, vals []interface{}, mu *sync.RWMutex, errCh chan error) {
+	defer api.PanicHandler(func(err error) {
+		errCh <- internalServerError(err, f)
+	})
+
+	fconf, err := f.CustomHTTPConfig()
+	if err != nil {
+		errCh <- err
+		return
+	}
+
+	// Here we build the input for resolving the fields which is sent as the body for the request.
+	inputs := make([]interface{}, len(vals))
+
+	graphql := fconf.RemoteGqlQueryName != ""
+	// For GraphQL requests, we substitute arguments in the GraphQL query/mutation to make to
+	// the remote endpoint using the values of other fields obtained from Dgraph.
+	if graphql {
+		requiredArgs := fconf.RequiredArgs
+		for i := 0; i < len(inputs); i++ {
+			vars := make(map[string]interface{})
+			// vals[i] has all the values fetched for this type from Dgraph, lets copy over the
+			// values required to process the remote GraphQL for the field into a new map.
+			mu.RLock()
+			m := vals[i].(map[string]interface{})
+			for k, v := range m {
+				if _, ok := requiredArgs[k]; ok {
+					vars[k] = v
+				}
+			}
+			mu.RUnlock()
+			inputs[i] = vars
+		}
+	} else {
+		for i := 0; i < len(inputs); i++ {
+			temp, err := copyTemplate(*fconf.Template)
+			if err != nil {
+				errCh <- err
+				return
+			}
+
+			mu.RLock()
+			if err := schema.SubstituteVarsInBody(&temp, vals[i].(map[string]interface{})); err != nil {
+				errCh <- x.GqlErrorf("Evaluation of custom field failed while substituting "+
+					"variables into body for remote endpoint with an error: %s for field: %s "+
+					"within type: %s.", err, f.Name(), f.GetObjectName()).WithLocations(f.Location())
+				mu.RUnlock()
+				return
+			}
+			mu.RUnlock()
+			inputs[i] = temp
+		}
+	}
+
+	if fconf.Mode == schema.BATCH {
+		var requestInput interface{}
+		requestInput = inputs
+
+		if graphql {
+			body := make(map[string]interface{})
+			body["query"] = fconf.RemoteGqlQuery
+			body["variables"] = map[string]interface{}{fconf.GraphqlBatchModeArgument: requestInput}
+			requestInput = body
+		}
+
+		b, err := json.Marshal(requestInput)
+		if err != nil {
+			errCh <- x.GqlErrorList{jsonMarshalError(err, f, inputs)}
+			return
+		}
+
+		b, err = makeRequest(nil, fconf.Method, fconf.URL, string(b), fconf.ForwardHeaders)
+		if err != nil {
+			errCh <- x.GqlErrorList{externalRequestError(err, f)}
+			return
+		}
+
+		// To collect errors from remote GraphQL endpoint and those encountered during execution.
+		var errs error
+		var result []interface{}
+		if graphql {
+			resp := &graphqlResp{}
+			err = json.Unmarshal(b, resp)
+			if err != nil {
+				errCh <- x.GqlErrorList{jsonUnmarshalError(err, f)}
+				return
+			}
+
+			if len(resp.Errors) > 0 {
+				errs = schema.AppendGQLErrs(errs, resp.Errors)
+			}
+			var ok bool
+			result, ok = resp.Data[fconf.RemoteGqlQueryName].([]interface{})
+			if !ok {
+				errCh <- schema.AppendGQLErrs(errs, keyNotFoundError(f, fconf.RemoteGqlQueryName))
+				return
+			}
+		} else {
+			if err := json.Unmarshal(b, &result); err != nil {
+				errCh <- x.GqlErrorList{jsonUnmarshalError(err, f)}
+				return
+			}
+		}
+
+		if len(result) != len(vals) {
+			gqlErr := x.GqlErrorf("Evaluation of custom field failed because expected result of"+
+				"external request to be of size %v, got: %v for field: %s within type: %s.",
+				len(vals), len(result), f.Name(), f.GetObjectName()).WithLocations(f.Location())
+			errCh <- schema.AppendGQLErrs(errs, gqlErr)
+			return
+		}
+
+		// Here we walk through all the objects in the array and substitute the value
+		// that we got from the remote endpoint with the right key in the object.
+		mu.Lock()
+		for idx, val := range vals {
+			val.(map[string]interface{})[f.Name()] = result[idx]
+			vals[idx] = val
+		}
+		mu.Unlock()
+		errCh <- errs
+		return
+	}
+
+	// This is single mode, make calls concurrently for each input and fill in the results.
+	errChan := make(chan error, len(inputs))
+	for i := 0; i < len(inputs); i++ {
+		go func(idx int, input interface{}) {
+			defer api.PanicHandler(
+				func(err error) {
+					errChan <- internalServerError(err, f)
+				})
+
+			requestInput := input
+			if graphql {
+				body := make(map[string]interface{})
+				body["query"] = fconf.RemoteGqlQuery
+				body["variables"] = input
+				requestInput = body
+			}
+
+			b, err := json.Marshal(requestInput)
+			if err != nil {
+				errChan <- x.GqlErrorList{jsonMarshalError(err, f, requestInput)}
+				return
+			}
+
+			if !graphql {
+				// For REST requests, we'll have to substitute the variables used in the URL.
+				mu.RLock()
+				fconf.URL, err = schema.SubstituteVarsInURL(fconf.URL,
+					vals[idx].(map[string]interface{}))
+				if err != nil {
+					mu.RUnlock()
+					gqlErr := x.GqlErrorf("Evaluation of custom field failed while substituting "+
+						"variables into URL for remote endpoint with an error: %s for field: %s "+
+						"within type: %s.", err, f.Name(),
+						f.GetObjectName()).WithLocations(f.Location())
+					errChan <- x.GqlErrorList{gqlErr}
+					return
+				}
+				mu.RUnlock()
+			}
+
+			b, err = makeRequest(nil, fconf.Method, fconf.URL, string(b), fconf.ForwardHeaders)
+			if err != nil {
+				errChan <- x.GqlErrorList{externalRequestError(err, f)}
+				return
+			}
+
+			var result interface{}
+			var errs error
+			if graphql {
+				resp := &graphqlResp{}
+				err = json.Unmarshal(b, resp)
+				if err != nil {
+					errChan <- x.GqlErrorList{jsonUnmarshalError(err, f)}
+					return
+				}
+
+				if len(resp.Errors) > 0 {
+					errs = schema.AppendGQLErrs(errs, resp.Errors)
+				}
+				var ok bool
+				result, ok = resp.Data[fconf.RemoteGqlQueryName]
+				if !ok {
+					errChan <- schema.AppendGQLErrs(errs,
+						keyNotFoundError(f, fconf.RemoteGqlQueryName))
+					return
+				}
+			} else {
+				if err := json.Unmarshal(b, &result); err != nil {
+					errChan <- x.GqlErrorList{jsonUnmarshalError(err, f)}
+					return
+				}
+			}
+
+			mu.Lock()
+			val, ok := vals[idx].(map[string]interface{})
+			if ok {
+				val[f.Name()] = result
+			}
+			mu.Unlock()
+			errChan <- errs
+		}(i, inputs[i])
+	}
+
+	var errs error
+	// Some of the errors can be null, so lets collect the non-null errors here.
+	for i := 0; i < len(inputs); i++ {
+		e := <-errChan
+		if e != nil {
+			errs = schema.AppendGQLErrs(errs, e)
+		}
+	}
+
+	errCh <- errs
+}
+
+// resolveNestedFields resolves fields which themselves don't have the @custom directive but their
+// children might
+//
+// queryUser {
+//	 id
+//	 classes {
+//	   name @custom...
+//   }
+// }
+// In the example above, resolveNestedFields would be called on classes field and vals would be the
+// list of all users.
+func resolveNestedFields(f schema.Field, vals []interface{}, mu *sync.RWMutex,
+	errCh chan error) {
+	defer api.PanicHandler(func(err error) {
+		errCh <- internalServerError(err, f)
+	})
+
+	// If this field doesn't have custom directive and also doesn't have any children,
+	// then there is nothing to do and we can just continue.
+	if len(f.SelectionSet()) == 0 {
+		errCh <- nil
+		return
+	}
+
+	// Here below we do the de-duplication by walking through the result set. That is we would
+	// go over vals and find the data for f to collect all unique values.
+	var input []interface{}
+	// node stores the pointer for a node. It is a map from id to the map for it.
+	nodes := make(map[string]interface{})
+
+	idField := f.Type().IDField()
+	if idField == nil {
+		idField = f.Type().XIDField()
+		if idField == nil {
+			// This should not happen as we only allow custom fields on types which either have
+			// ID or a field with @id directive.
+			errCh <- nil
+			return
+		}
+	}
+
+	idFieldName := idField.Name()
+
+	// Here we walk through the array and collect all unique values for this field. In the
+	// example at the start of the function, we could be collecting all unique classes
+	// across all users. This is where the batching happens so that we make one call per
+	// field and not a separate call per user.
+	mu.RLock()
+	for _, v := range vals {
+		val, ok := v.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		fieldVals, ok := val[f.Name()].([]interface{})
+		if !ok {
+			continue
+		}
+		for _, fieldVal := range fieldVals {
+			fv, ok := fieldVal.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			id, ok := fv[idFieldName].(string)
+			if !ok {
+				// If a type has a field of type ID! and it is not explicitly requested by the
+				// user as part of the query, we would still have asked for it under the alias
+				// dgraph.uid, so let's look for that here.
+				id, ok = fv["dgraph.uid"].(string)
+				if !ok {
+					continue
+				}
+			}
+			if _, ok := nodes[id]; !ok {
+				input = append(input, fieldVal)
+				nodes[id] = fieldVal
+			}
+		}
+	}
+	mu.RUnlock()
+
+	if err := resolveCustomFields(f.SelectionSet(), input); err != nil {
+		errCh <- err
+		return
+	}
+
+	mu.Lock()
+	for _, v := range vals {
+		val, ok := v.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		fieldVals, ok := val[f.Name()].([]interface{})
+		if !ok {
+			continue
+		}
+		for idx, fieldVal := range fieldVals {
+			fv, ok := fieldVal.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			id, ok := fv[idFieldName].(string)
+			if !ok {
+				id, ok = fv["dgraph.uid"].(string)
+				if !ok {
+					continue
+				}
+			}
+			// Get the pointer of the map corresponding to this id and put it at the
+			// correct place.
+			mval := nodes[id]
+			fieldVals[idx] = mval
+		}
+	}
+	mu.Unlock()
+	errCh <- nil
+}
+
+// resolveCustomFields resolves fields with custom directive. Here is the rough algorithm that it
+// follows.
+// queryUser {
+//	name @custom
+//	age
+//	school {
+//		name
+//		children
+//		class { @custom
+//			name
+//			numChildren
+//		}
+//	}
+//	cars { @custom
+//		name
+//	}
+// }
+// For fields with @custom directive
+// 1. There would be one query sent to the remote endpoint.
+// 2. In the above example, to fetch class all the school ids would be aggregated across different
+// users deduplicated and then one query sent. The results would then be filled back appropriately.
+//
+// For fields without custom directive we recursively call resolveCustomFields and let it do the
+// work.
+// TODO - We can be smarter about this and know before processing the query if we should be making
+// this recursive call upfront.
+func resolveCustomFields(fields []schema.Field, data interface{}) error {
+	if data == nil {
+		return nil
+	}
+
+	var vals []interface{}
+	switch v := data.(type) {
+	case []interface{}:
+		vals = v
+	case interface{}:
+		vals = []interface{}{v}
+	}
+
+	if len(vals) == 0 {
+		return nil
+	}
+
+	// This mutex protects access to vals as it is concurrently read and written to by multiple
+	// goroutines.
+	mu := &sync.RWMutex{}
+	errCh := make(chan error, len(fields))
+	numRoutines := 0
+
+	for _, f := range fields {
+		if f.Skip() || !f.Include() {
+			continue
+		}
+
+		numRoutines++
+		hasCustomDirective, _ := f.HasCustomDirective()
+		if !hasCustomDirective {
+			go resolveNestedFields(f, vals, mu, errCh)
+		} else {
+			go resolveCustomField(f, vals, mu, errCh)
+		}
+	}
+
+	var errs error
+	for i := 0; i < numRoutines; i++ {
+		if err := <-errCh; err != nil {
+			errs = schema.AppendGQLErrs(errs, err)
+		}
+	}
+
+	return errs
 }
 
 // completeObject builds a json GraphQL result object for the current query level.
@@ -704,7 +1193,6 @@ func completeDgraphResult(ctx context.Context, field schema.Field, dgResult []by
 // nil and the error propagates to the enclosing level.
 func completeObject(
 	path []interface{},
-	typ schema.Type,
 	fields []schema.Field,
 	res map[string]interface{}) ([]byte, x.GqlErrorList) {
 
@@ -739,7 +1227,7 @@ func completeObject(
 		x.Check2(buf.WriteString(f.ResponseName()))
 		x.Check2(buf.WriteString(`": `))
 
-		val := res[f.ResponseName()]
+		val := res[f.Name()]
 		if f.Name() == schema.Typename {
 			// From GraphQL spec:
 			// https://graphql.github.io/graphql-spec/June2018/#sec-Type-Name-Introspection
@@ -781,9 +1269,17 @@ func completeValue(
 
 	switch val := val.(type) {
 	case map[string]interface{}:
-		return completeObject(path, field.Type(), field.SelectionSet(), val)
+		return completeObject(path, field.SelectionSet(), val)
 	case []interface{}:
 		return completeList(path, field, val)
+	case []map[string]interface{}:
+		// This case is different from the []interface{} case above and is true for admin queries
+		// where we built the val ourselves.
+		listVal := make([]interface{}, 0, len(val))
+		for _, v := range val {
+			listVal = append(listVal, v)
+		}
+		return completeList(path, field, listVal)
 	default:
 		if val == nil {
 			if field.Type().ListType() != nil {
@@ -956,4 +1452,142 @@ func maxPathLength(f schema.Field) int {
 	}
 
 	return 1 + childMax
+}
+
+// a httpResolver can resolve a single GraphQL field from an HTTP endpoint
+type httpResolver struct {
+	*http.Client
+	resultCompleter ResultCompleter
+}
+
+type httpQueryResolver httpResolver
+type httpMutationResolver httpResolver
+
+// NewHTTPQueryResolver creates a resolver that can resolve GraphQL query from an HTTP endpoint
+func NewHTTPQueryResolver(hc *http.Client, rc ResultCompleter) QueryResolver {
+	return &httpQueryResolver{hc, rc}
+}
+
+// NewHTTPMutationResolver creates a resolver that resolves GraphQL mutation from an HTTP endpoint
+func NewHTTPMutationResolver(hc *http.Client, rc ResultCompleter) MutationResolver {
+	return &httpMutationResolver{hc, rc}
+}
+
+func (hr *httpResolver) Resolve(ctx context.Context, field schema.Field) *Resolved {
+	span := otrace.FromContext(ctx)
+	stop := x.SpanTimer(span, "resolveHTTP")
+	defer stop()
+
+	resolved := hr.rewriteAndExecute(ctx, field)
+	hr.resultCompleter.Complete(ctx, resolved)
+	return resolved
+}
+
+func makeRequest(client *http.Client, method, url, body string,
+	header http.Header) ([]byte, error) {
+	req, err := http.NewRequest(method, url, bytes.NewBufferString(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header = header
+
+	// TODO - Needs to be fixed, we shouldn't be initiating a new HTTP client everytime.
+	if client == nil {
+		client = &http.Client{
+			Timeout: time.Minute,
+		}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return nil, errors.Errorf("unexpected status code: %v", resp.StatusCode)
+	}
+
+	defer resp.Body.Close()
+
+	b, err := ioutil.ReadAll(resp.Body)
+
+	return b, err
+}
+
+func (hr *httpResolver) rewriteAndExecute(ctx context.Context, field schema.Field) *Resolved {
+	emptyResult := func(err error) *Resolved {
+		return &Resolved{
+			Data:  map[string]interface{}{field.Name(): nil},
+			Field: field,
+			Err:   schema.AsGQLErrors(err),
+		}
+	}
+
+	hrc, err := field.CustomHTTPConfig()
+	if err != nil {
+		return emptyResult(err)
+	}
+
+	var body string
+	if hrc.Template != nil {
+		b, err := json.Marshal(*hrc.Template)
+		if err != nil {
+			return emptyResult(jsonMarshalError(err, field, *hrc.Template))
+		}
+		body = string(b)
+	}
+	b, err := makeRequest(hr.Client, hrc.Method, hrc.URL, body, hrc.ForwardHeaders)
+	if err != nil {
+		return emptyResult(externalRequestError(err, field))
+	}
+
+	// this means it had body and not graphql, so just unmarshal it and return
+	if hrc.RemoteGqlQueryName == "" {
+		var result interface{}
+		if err := json.Unmarshal(b, &result); err != nil {
+			return emptyResult(jsonUnmarshalError(err, field))
+		}
+		return &Resolved{
+			Data:  map[string]interface{}{field.Name(): result},
+			Field: field,
+		}
+	}
+
+	// we will reach here if it was a graphql request
+	var resp struct {
+		Data   map[string]interface{} `json:"data,omitempty"`
+		Errors x.GqlErrorList         `json:"errors,omitempty"`
+	}
+	err = json.Unmarshal(b, &resp)
+	if err != nil {
+		gqlErr := jsonUnmarshalError(err, field)
+		resp.Errors = append(resp.Errors, schema.AsGQLErrors(gqlErr)...)
+		return emptyResult(resp.Errors)
+	}
+	data, ok := resp.Data[hrc.RemoteGqlQueryName]
+	if !ok {
+		return emptyResult(resp.Errors)
+	}
+
+	return &Resolved{
+		Data:  map[string]interface{}{field.Name(): data},
+		Field: field,
+		Err:   resp.Errors,
+	}
+}
+
+func (h *httpQueryResolver) Resolve(ctx context.Context, query schema.Query) *Resolved {
+	return (*httpResolver)(h).Resolve(ctx, query)
+}
+
+func (h *httpMutationResolver) Resolve(ctx context.Context, mutation schema.Mutation) (*Resolved,
+	bool) {
+	resolved := (*httpResolver)(h).Resolve(ctx, mutation)
+	return resolved, resolved.Err == nil || resolved.Err.Error() == ""
+}
+
+func EmptyResult(f schema.Field, err error) *Resolved {
+	return &Resolved{
+		Data:  map[string]interface{}{f.Name(): nil},
+		Field: f,
+		Err:   schema.GQLWrapLocationf(err, f.Location(), "resolving %s failed", f.Name()),
+	}
 }

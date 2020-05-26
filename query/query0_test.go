@@ -17,14 +17,13 @@
 package query
 
 import (
+	"context"
 	"os"
 	"testing"
 
-	context "golang.org/x/net/context"
-
 	"github.com/stretchr/testify/require"
 
-	"github.com/dgraph-io/dgo/v2"
+	"github.com/dgraph-io/dgo/v200"
 	"github.com/dgraph-io/dgraph/gql"
 	"github.com/dgraph-io/dgraph/testutil"
 	"github.com/dgraph-io/dgraph/x"
@@ -450,16 +449,14 @@ func TestLevelBasedFacetVarAggSum(t *testing.T) {
 			{
 			  "path": [
 				{
-				  "uid": "0x3e9"
+				  "uid": "0x3e9",
+				  "path|weight": 0.1
 				},
 				{
-				  "uid": "0x3ea"
+				  "uid": "0x3ea",
+				  "path|weight": 0.7
 				}
 			  ],
-			  "path|weight": {
-				"0": 0.1,
-				"1": 0.7
-			  },
 			  "sumw": 0.8
 			}
 		  ]
@@ -488,55 +485,49 @@ func TestLevelBasedFacetVarSum(t *testing.T) {
 	js := processQueryNoErr(t, query)
 	require.JSONEq(t, `
 		{
-			"data": {
-			  "friend": [
-				{
-				  "path|weight": {
-					"0": 0.1,
-					"1": 0.7
-				  },
-				  "path": [
-					{
-					  "path|weight": {
-						"0": 0.1,
-						"1": 1.5
-					  },
-					  "path": [
-						{
-						  "count(follow)": 1,
-						  "val(L4)": 1.2
-						},
-						{
-						  "count(follow)": 1,
-						  "val(L4)": 3.9
-						}
-					  ]
-					},
-					{
-					  "path|weight": {
-						"0": 0.6
-					  },
-					  "path": [
-						{
-						  "count(follow)": 1,
-						  "val(L4)": 3.9
-						}
-					  ]
-					}
-				  ]
-				}
-			  ],
-			  "sum": [
-				{
-				  "name": "John",
-				  "val(L4)": 3.9
-				},
-				{
-				  "name": "Matt",
-				  "val(L4)": 1.2
-				}
-			  ]
-			}
+		  "data": {
+		    "friend": [
+		      {
+		        "path": [
+		          {
+		            "path": [
+		              {
+		                "count(follow)": 1,
+		                "val(L4)": 1.2,
+		                "path|weight": 0.1
+		              },
+		              {
+		                "count(follow)": 1,
+		                "val(L4)": 3.9,
+		                "path|weight": 1.5
+		              }
+		            ],
+		            "path|weight": 0.1
+		          },
+		          {
+		            "path": [
+		              {
+		                "count(follow)": 1,
+		                "val(L4)": 3.9,
+		                "path|weight": 0.6
+		              }
+		            ],
+		            "path|weight": 0.7
+		          }
+		        ]
+		      }
+		    ],
+		    "sum": [
+		      {
+		        "name": "John",
+		        "val(L4)": 3.9
+		      },
+		      {
+		        "name": "Matt",
+		        "val(L4)": 1.2
+		      }
+		    ]
+		  }
 		}
 	`,
 		js)
@@ -566,16 +557,14 @@ func TestLevelBasedSumMix1(t *testing.T) {
 				  "age": 38,
 				  "path": [
 					{
-					  "val(L2)": 38.2
+					  "val(L2)": 38.2,
+					  "path|weight": 0.2
 					},
 					{
-					  "val(L2)": 38.1
+					  "val(L2)": 38.1,
+					  "path|weight": 0.1
 					}
-				  ],
-				  "path|weight": {
-					"0": 0.2,
-					"1": 0.1
-				  }
+				  ]
 				}
 			  ],
 			  "sum": [
@@ -612,56 +601,50 @@ func TestLevelBasedFacetVarSum1(t *testing.T) {
 	`
 	js := processQueryNoErr(t, query)
 	require.JSONEq(t, `
-		{
-			"data": {
-			  "friend": [
-				{
-				  "path": [
-					{
-					  "name": "Bob",
-					  "path": [
-						{
-						  "val(L3)": 0.2
-						},
-						{
-						  "val(L3)": 2.9
-						}
-					  ],
-					  "path|weight": {
-						"0": 0.1,
-						"1": 1.5
-					  }
-					},
-					{
-					  "name": "Matt",
-					  "path": [
-						{
-						  "val(L3)": 2.9
-						}
-					  ],
-					  "path|weight": {
-						"0": 0.6
-					  }
-					}
-				  ],
-				  "path|weight": {
-					"0": 0.1,
-					"1": 0.7
-				  }
-				}
-			  ],
-			  "sum": [
-				{
-				  "name": "John",
-				  "val(L3)": 2.9
-				},
-				{
-				  "name": "Matt",
-				  "val(L3)": 0.2
-				}
-			  ]
-			}
-		}
+        {
+          "data": {
+            "friend": [
+              {
+                "path": [
+                  {
+                    "name": "Bob",
+                    "path": [
+                      {
+                        "val(L3)": 0.2,
+                        "path|weight": 0.1
+                      },
+                      {
+                        "val(L3)": 2.9,
+                        "path|weight": 1.5
+                      }
+                    ],
+                    "path|weight": 0.1
+                  },
+                  {
+                    "name": "Matt",
+                    "path": [
+                      {
+                        "val(L3)": 2.9,
+                        "path|weight": 0.6
+                      }
+                    ],
+                    "path|weight": 0.7
+                  }
+                ]
+              }
+            ],
+            "sum": [
+              {
+                "name": "John",
+                "val(L3)": 2.9
+              },
+              {
+                "name": "Matt",
+                "val(L3)": 0.2
+              }
+            ]
+          }
+        }
 	`, js)
 }
 
@@ -685,69 +668,61 @@ func TestLevelBasedFacetVarSum2(t *testing.T) {
 	`
 	js := processQueryNoErr(t, query)
 	require.JSONEq(t, `
-		{
-			"data": {
-			  "friend": [
-				{
-				  "path": [
-					{
-					  "path": [
-						{
-						  "path": [
-							{
-							  "val(L4)": 0.8
-							}
-						  ],
-						  "path|weight": {
-							"0": 0.6
-						  }
-						},
-						{
-						  "path": [
-							{
-							  "val(L4)": 2.9
-							}
-						  ]
-						}
-					  ],
-					  "path|weight": {
-						"0": 0.1,
-						"1": 1.5
-					  }
-					},
-					{
-					  "path": [
-						{
-						  "path": [
-							{
-							  "val(L4)": 2.9
-							}
-						  ]
-						}
-					  ],
-					  "path|weight": {
-						"0": 0.6
-					  }
-					}
-				  ],
-				  "path|weight": {
-					"0": 0.1,
-					"1": 0.7
-				  }
-				}
-			  ],
-			  "sum": [
-				{
-				  "name": "Bob",
-				  "val(L4)": 2.9
-				},
-				{
-				  "name": "John",
-				  "val(L4)": 0.8
-				}
-			  ]
-			}
-		}
+        {
+          "data": {
+            "friend": [
+              {
+                "path": [
+                  {
+                    "path": [
+                      {
+                        "path": [
+                          {
+                            "val(L4)": 0.8,
+                            "path|weight": 0.6
+                          }
+                        ],
+                        "path|weight": 0.1
+                      },
+                      {
+                        "path": [
+                          {
+                            "val(L4)": 2.9
+                          }
+                        ],
+                        "path|weight": 1.5
+                      }
+                    ],
+                    "path|weight": 0.1
+                  },
+                  {
+                    "path": [
+                      {
+                        "path": [
+                          {
+                            "val(L4)": 2.9
+                          }
+                        ],
+                        "path|weight": 0.6
+                      }
+                    ],
+                    "path|weight": 0.7
+                  }
+                ]
+              }
+            ],
+            "sum": [
+              {
+                "name": "Bob",
+                "val(L4)": 2.9
+              },
+              {
+                "name": "John",
+                "val(L4)": 0.8
+              }
+            ]
+          }
+        }
 	`, js)
 }
 
@@ -1780,13 +1755,10 @@ func TestFilterFacetval(t *testing.T) {
 			"data": {
 			  "friend": [
 				{
-				  "path|weight": {
-					"0": 0.2,
-					"1": 0.1
-				  },
 				  "path": [
 					{
-					  "name": "Glenn Rhee"
+					  "name": "Glenn Rhee",
+					  "path|weight": 0.2
 					},
 					{
 					  "name": "Andrea",
@@ -1795,7 +1767,8 @@ func TestFilterFacetval(t *testing.T) {
 						  "name": "Glenn Rhee",
 						  "val(L)": 0.2
 						}
-					  ]
+					  ],
+					  "path|weight": 0.1
 					}
 				  ]
 				}
@@ -1830,12 +1803,10 @@ func TestFilterFacetVar1(t *testing.T) {
 				  "name": "Glenn Rhee"
 				},
 				{
-				  "name": "Andrea"
+				  "name": "Andrea",
+				  "path|weight1": 0.2
 				}
-			  ],
-			  "path|weight1": {
-				"1": 0.2
-			  }
+			  ]
 			}
 		  ]
 		}
@@ -2247,7 +2218,6 @@ func TestFilterUsingLenFunction(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		t.Log("Running: ", tc.name)
 		js := processQueryNoErr(t, tc.in)
 		require.JSONEq(t, tc.out, js)
 	}
@@ -2411,9 +2381,9 @@ func TestDateTimeQuery(t *testing.T) {
 			  "q": [
 				{
 				  "uid": "0x3",
-				  "best_friend|since": "2018-03-24T14:41:57+05:30",
 				  "best_friend": {
-					"uid": "0x40"
+					"uid": "0x40",
+				    "best_friend|since": "2018-03-24T14:41:57+05:30"
 				  }
 				}
 			  ]
@@ -2439,9 +2409,9 @@ func TestDateTimeQuery(t *testing.T) {
 			  "q": [
 				{
 				  "uid": "0x2",
-				  "best_friend|since": "2019-03-28T14:41:57+30:00",
 				  "best_friend": {
-					"uid": "0x40"
+					"uid": "0x40",
+				    "best_friend|since": "2019-03-28T14:41:57+30:00"
 				  }
 				}
 			  ]

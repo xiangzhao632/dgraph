@@ -62,11 +62,13 @@ The client can be obtained in the usual way via `go get`:
 ```sh
 # Requires at least Go 1.11
 export GO111MODULE=on
-go get -u -v github.com/dgraph-io/dgo/v2
+go get -u -v github.com/dgraph-io/dgo/v200
 ```
 
 The full [GoDoc](https://godoc.org/github.com/dgraph-io/dgo) contains
 documentation for the client API along with examples showing how to use it.
+
+More details on the supported versions can be found at [this link](https://github.com/dgraph-io/dgo#supported-versions).
 
 ### Create the client
 
@@ -437,13 +439,21 @@ fmt.Println(string(resp.Json))
 
 ```
 
+## C\#
+
+The official C# client [can be found here](https://github.com/dgraph-io/dgraph.net).
+Follow the instructions in the [README](https://github.com/dgraph-io/dgraph.net#readme) to get
+it up and running.
+
+More details on the supported versions can be found at
+[this link](https://github.com/dgraph-io/dgraph.net#supported-versions).
 
 ## Java
 
-The official Java client [can be found here](https://github.com/dgraph-io/dgraph4j)
-and it fully supports Dgraph v1.0.x. Follow the instructions in the
-[README](https://github.com/dgraph-io/dgraph4j#readme)
-to get it up and running.
+The official Java client [can be found here](https://github.com/dgraph-io/dgraph4j). 
+Follow the instructions in the [README](https://github.com/dgraph-io/dgraph4j#readme) to get it up and running.
+
+More details on the supported versions can be found at [this link](https://github.com/dgraph-io/dgraph4j#supported-versions).
 
 We also have a [DgraphJavaSample] project, which contains an end-to-end
 working example of how to use the Java client.
@@ -452,20 +462,35 @@ working example of how to use the Java client.
 
 ## JavaScript
 
-The official JavaScript client [can be found here](https://github.com/dgraph-io/dgraph-js)
-and it fully supports Dgraph v1.0.x. Follow the instructions in the
-[README](https://github.com/dgraph-io/dgraph-js#readme) to get it up and running.
+### gRPC
+
+The official JavaScript gRPC client [can be found here](https://github.com/dgraph-io/dgraph-js).
+Follow the instructions in the [README](https://github.com/dgraph-io/dgraph-js#readme) to get it up and running.
+
+More details on the supported versions can be found at [this link](https://github.com/dgraph-io/dgraph-js#supported-versions).
 
 We also have a [simple example](https://github.com/dgraph-io/dgraph-js/tree/master/examples/simple)
-project, which contains an end-to-end working example of how to use the JavaScript client,
+project, which contains an end-to-end working example of how to use the JavaScript gRPC client,
+for Node.js >= v6.
+
+### HTTP
+
+The official JavaScript HTTP client [can be found here](https://github.com/dgraph-io/dgraph-js-http).
+Follow the instructions in the [README](https://github.com/dgraph-io/dgraph-js-http#readme) to get it up and running.
+
+More details on the supported versions can be found at [this link](https://github.com/dgraph-io/dgraph-js-http#supported-versions).
+
+We also have a [simple example](https://github.com/dgraph-io/dgraph-js-http/tree/master/examples/simple)
+project, which contains an end-to-end working example of how to use the JavaScript HTTP client,
 for Node.js >= v6.
 
 ## Python
 
-The official Python client [can be found here](https://github.com/dgraph-io/pydgraph)
-and it fully supports Dgraph v1.0.x and Python versions >= 2.7 and >= 3.5. Follow the
-instructions in the [README](https://github.com/dgraph-io/pydgraph#readme) to get it
+The official Python client [can be found here](https://github.com/dgraph-io/pydgraph). 
+Follow the instructions in the [README](https://github.com/dgraph-io/pydgraph#readme) to get it
 up and running.
+
+More details on the supported versions can be found at [this link](https://github.com/dgraph-io/pydgraph#supported-versions).
 
 We also have a [simple example](https://github.com/dgraph-io/pydgraph/tree/master/examples/simple)
 project, which contains an end-to-end working example of how to use the Python client.
@@ -479,7 +504,6 @@ These third-party clients are contributed by the community and are not officiall
 ### C\#
 
 - https://github.com/AlexandreDaSilva/DgraphNet
-- https://github.com/MichaelJCompton/Dgraph-dotnet
 
 ### Dart
 
@@ -898,24 +922,6 @@ $ curl -X POST --compressed -H "Content-Type: application/graphql+-" localhost:8
 ```
 {{% /notice %}}
 
-### Health Check and Alpha Info
-
-`/health` returns HTTP status code 200 if the worker is running, HTTP 503 otherwise.
-The body of the response contains information about the running alpha and its version.
-
-```sh
-$ curl localhost:8080/health
-```
-
-```json
-{
-  "version": "v1.1.0",
-  "instance": "alpha",
-  "uptime": 1928423
-}
-```
-
-Here, `uptime` is in nanoseconds (type `time.Duration` in Go).
 
 ### Run a query in JSON format
 

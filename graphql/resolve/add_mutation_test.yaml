@@ -25,6 +25,7 @@
           "Author.dob":"2000-01-01",
           "Author.posts":[]
         }
+
 -
   name: "Add multiple mutation with variables"
   gqlmutation: |
@@ -36,11 +37,13 @@
       }
     }
   gqlvariables: |
-    { "auth": [
-      { "name": "A.N. Author"
-      },
-      { "name": "Different Author"
-      }
+    {
+      "auth": [{
+          "name": "A.N. Author"
+        },
+        {
+          "name": "Different Author"
+        }
       ]
     }
   explanation: "A uid and type should get injected and all data transformed to
@@ -78,32 +81,40 @@
         }
 
 -
-  name: "Add Mutation with mixed vars and embedded value"
+  name: "Add Mutation with Password field"
   gqlmutation: |
-    mutation addAuthor($name: String!) {
-      addAuthor(input: [{ name: $name, posts: []}]) {
-        author {
+    mutation addUser($name: String!, $pwd: String!) {
+      addUser(input: [{ name: $name, pwd: $pwd}]) {
+        user {
           name
         }
       }
     }
   gqlvariables: |
-    { "name":  "A.N. Author" }
+    { "name":  "A.N. Author", "pwd": "Password" }
   explanation: "The input and variables should be used for the mutation, with a uid and type
     getting injected and all data transformed to underlying Dgraph edge names"
   dgmutations:
     - setjson: |
-        { "uid":"_:Author1",
-          "dgraph.type":["Author"],
-          "Author.name":"A.N. Author",
-          "Author.posts":[]
+        { "uid":"_:User2",
+          "dgraph.type":["User"],
+          "User.name":"A.N. Author",
+          "User.pwd":"Password"
         }
+      cond: "@if(eq(len(User2), 0))"
+  dgquery: |-
+    query {
+      User2 as User2(func: eq(User.name, "A.N. Author")) @filter(type(User)) {
+        uid
+      }
+    }
 
 -
   name: "Add Multiple Mutations with embedded value"
   gqlmutation: |
     mutation addAuthor {
-      addAuthor(input: [{ name: "A.N. Author", posts: []}, {name: "Different Author", posts: []}]) {
+      addAuthor(input: [{ name: "A.N. Author", posts: []}, 
+                        { name: "Different Author", posts: []}]) {
         author {
           name
         }
@@ -272,25 +283,25 @@
   explanation: "The add mutation should get rewritten into a Dgraph upsert mutation"
   dgquery: |-
     query {
-      State1 as State1(func: eq(State.code, "nsw")) @filter(type(State)) {
+      State2 as State2(func: eq(State.code, "nsw")) @filter(type(State)) {
         uid
       }
-      Country2 as Country2(func: uid(0x12)) @filter(type(Country)) {
+      Country3 as Country3(func: uid(0x12)) @filter(type(Country)) {
         uid
       }
     }
   dgmutations:
     - setjson: |
-        { "uid" : "_:State1",
+        { "uid" : "_:State2",
           "dgraph.type": ["State"],
           "State.name": "NSW",
           "State.code": "nsw",
           "State.country": {
             "uid": "0x12",
-            "Country.states": [ { "uid": "_:State1" } ]
+            "Country.states": [ { "uid": "_:State2" } ]
           }
         }
-      cond: "@if(eq(len(State1), 0) AND eq(len(Country2), 1))"
+      cond: "@if(eq(len(State2), 0) AND eq(len(Country3), 1))"
 
 -
   name: "Add mutation using code on type which also has an ID field"
@@ -312,18 +323,18 @@
   explanation: "The add mutation should get rewritten into a Dgraph upsert mutation"
   dgquery: |-
     query {
-      Editor1 as Editor1(func: eq(Editor.code, "editor")) @filter(type(Editor)) {
+      Editor2 as Editor2(func: eq(Editor.code, "editor")) @filter(type(Editor)) {
         uid
       }
     }
   dgmutations:
     - setjson: |
-        { "uid" : "_:Editor1",
+        { "uid" : "_:Editor2",
           "dgraph.type": ["Editor"],
           "Editor.name": "A.N. Editor",
           "Editor.code": "editor"
         }
-      cond: "@if(eq(len(Editor1), 0))"
+      cond: "@if(eq(len(Editor2), 0))"
 
 -
   name: "Deep add mutation"
@@ -465,12 +476,16 @@
       Post3 as Post3(func: uid(0x123)) @filter(type(Post)) {
         uid
       }
+      var(func: uid(Post3)) {
+        Author4 as Post.author
+      }
     }
   dgmutations:
     - setjson: |
         { "uid": "_:Author1",
           "dgraph.type": [ "Author" ],
           "Author.name": "A.N. Author",
+          "Author.dob": "2000-01-01",
           "Author.dob": "2000-01-01",
           "Author.posts": [
             {
@@ -490,6 +505,13 @@
             }
           ]
         }
+      deletejson: |
+        [
+          {
+            "uid": "uid(Author4)",
+            "Author.posts": [{"uid": "uid(Post3)"}]
+          }
+        ]
       cond: "@if(eq(len(Post3), 1))"
 
 -
@@ -538,8 +560,14 @@
       Post3 as Post3(func: uid(0x123)) @filter(type(Post)) {
         uid
       }
-      Post6 as Post6(func: uid(0x124)) @filter(type(Post)) {
+      var(func: uid(Post3)) {
+        Author4 as Post.author
+      }
+      Post7 as Post7(func: uid(0x124)) @filter(type(Post)) {
         uid
+      }
+      var(func: uid(Post7)) {
+        Author8 as Post.author
       }
     }
   dgmutations:
@@ -566,31 +594,53 @@
             }
           ]
         }
+      deletejson: |
+        [
+          {
+            "uid": "uid(Author4)",
+            "Author.posts": [
+              {
+              "uid": "uid(Post3)"
+              }
+            ]
+          }
+        ]
       cond: "@if(eq(len(Post3), 1))"
     - setjson: |
-        { "uid": "_:Author4",
+        { "uid": "_:Author5",
           "dgraph.type": [ "Author" ],
           "Author.name": "Different Author",
           "Author.dob": "2000-01-01",
           "Author.posts": [
             {
-              "uid": "_:Post5",
+              "uid": "_:Post6",
               "dgraph.type": [ "Post" ],
               "Post.title": "New new post",
               "Post.text": "A wonderful post",
               "Post.author": {
-                "uid": "_:Author4"
+                "uid": "_:Author5"
               }
             },
             {
               "uid": "0x124",
               "Post.author": {
-                "uid": "_:Author4"
+                "uid": "_:Author5"
               }
             }
           ]
         }
-      cond: "@if(eq(len(Post6), 1))"
+      deletejson: |
+        [
+          {
+            "uid": "uid(Author8)",
+            "Author.posts": [
+              {
+              "uid": "uid(Post7)"
+              }
+            ]
+          }
+        ]
+      cond: "@if(eq(len(Post7), 1))"
 
 -
   name: "Deep add with two existing"
@@ -623,8 +673,14 @@
       Post2 as Post2(func: uid(0x123)) @filter(type(Post)) {
         uid
       }
-      Post3 as Post3(func: uid(0x456)) @filter(type(Post)) {
+      var(func: uid(Post2)) {
+        Author3 as Post.author
+      }
+      Post4 as Post4(func: uid(0x456)) @filter(type(Post)) {
         uid
+      }
+      var(func: uid(Post4)) {
+        Author5 as Post.author
       }
     }
   dgmutations:
@@ -648,7 +704,18 @@
             }
           ]
         }
-      cond: "@if(eq(len(Post2), 1) AND eq(len(Post3), 1))"
+      deletejson: |
+        [
+          {
+            "uid": "uid(Author3)",
+            "Author.posts": [{"uid": "uid(Post2)"}]
+          },
+          {
+            "uid": "uid(Author5)",
+            "Author.posts": [{"uid": "uid(Post4)"}]
+          }
+        ]
+      cond: "@if(eq(len(Post2), 1) AND eq(len(Post4), 1))"
 
 -
   name: "Deep add with null"
@@ -767,8 +834,11 @@
   explanation: "The add mutation has two options depending on if dg exists"
   dgquery: |-
     query {
-      State2 as State2(func: eq(State.code, "dg")) @filter(type(State)) {
+      State3 as State3(func: eq(State.code, "dg")) @filter(type(State)) {
         uid
+      }
+      var(func: uid(State3)) {
+        Country4 as State.country
       }
     }
   dgmutations:
@@ -778,7 +848,7 @@
           "dgraph.type": ["Country"],
           "Country.name": "Dgraph Land",
           "Country.states": [ {
-            "uid": "_:State2",
+            "uid": "_:State3",
             "dgraph.type": ["State"],
             "State.code": "dg",
             "State.name": "Dgraph",
@@ -787,20 +857,27 @@
             }
           } ]
         }
-      cond: "@if(eq(len(State2), 0))"
+      cond: "@if(eq(len(State3), 0))"
     - setjson: |
         {
           "uid": "_:Country1",
           "dgraph.type": ["Country"],
           "Country.name": "Dgraph Land",
           "Country.states": [ {
-            "uid": "uid(State2)",
+            "uid": "uid(State3)",
             "State.country": {
               "uid": "_:Country1"
             }
           } ]
         }
-      cond: "@if(eq(len(State2), 1))"
+      deletejson: |
+        [
+          {
+            "uid": "uid(Country4)",
+            "Country.states": [{"uid": "uid(State3)"}]
+          }
+        ]
+      cond: "@if(eq(len(State3), 1))"
 
 -
   name: "Add mutation with deep xid that must be reference"
@@ -825,8 +902,11 @@
     because it's missing required field name"
   dgquery: |-
     query {
-      State2 as State2(func: eq(State.code, "dg")) @filter(type(State)) {
+      State3 as State3(func: eq(State.code, "dg")) @filter(type(State)) {
         uid
+      }
+      var(func: uid(State3)) {
+        Country4 as State.country
       }
     }
   dgmutations:
@@ -836,10 +916,583 @@
           "dgraph.type": ["Country"],
           "Country.name": "Dgraph Land",
           "Country.states": [ {
-            "uid": "uid(State2)",
+            "uid": "uid(State3)",
             "State.country": {
               "uid": "_:Country1"
             }
           } ]
         }
-      cond: "@if(eq(len(State2), 1))"
+      deletejson: |
+        [
+          {
+            "uid": "uid(Country4)",
+            "Country.states": [{"uid": "uid(State3)"}]
+          }
+        ]
+      cond: "@if(eq(len(State3), 1))"
+
+
+-
+  name: "deprecated fields can be mutated"
+  gqlmutation: |
+    mutation addCategory($cat: AddCategoryInput!) {
+      addCategory(input: [$cat]) {
+        category {
+          name
+          iAmDeprecated
+        }
+      }
+    }
+  gqlvariables: |
+    { "cat":
+      { "name": "A Category",
+        "iAmDeprecated": "but I can be written to"
+      }
+    }
+  dgmutations:
+    - setjson: |
+        { "uid": "_:Category1",
+          "dgraph.type": ["Category"],
+          "Category.name": "A Category",
+          "Category.iAmDeprecated": "but I can be written to"
+        }
+
+-
+  name: "Add mutation with reverse predicate"
+  gqlmutation: |
+    mutation addMovieDirector($dir: AddMovieDirectorInput!) {
+      addMovieDirector(input: [$dir]) {
+        moviedirector {
+          id
+        }
+      }
+    }
+  gqlvariables: |
+    { "dir":
+      { "name": "Steven Spielberg",
+        "directed": [{ "id": "0x2" }]
+      }
+    }
+  explanation: "The reference to the directed.movies edge node should not add a new movie edge."
+  dgquery: |-
+    query {
+      Movie2 as Movie2(func: uid(0x2)) @filter(type(Movie)) {
+        uid
+      }
+    }
+  dgmutations:
+    - setjson: |
+        { "uid" : "_:MovieDirector1",
+          "dgraph.type" : ["MovieDirector"],
+          "MovieDirector.name" : "Steven Spielberg",
+          "directed.movies": [{
+            "uid" : "0x2"
+          }]
+        }
+      cond: "@if(eq(len(Movie2), 1))"
+
+- name: "Top Level Duplicate XIDs with same object Test"
+  gqlmutation: |
+    mutation addState($input: [AddStateInput!]!) {
+      addState(input: $input) {
+        state {
+          code
+          name
+        }
+      }
+    }
+  gqlvariables: |
+    {
+      "input": [
+        {"name": "State1", "code": "S1"},
+        {"name": "State1", "code": "S1"}
+      ]
+    }
+  explanation: "When duplicate XIDs are given as input at top level, but the object structure is
+  same, it should return error."
+  error:
+    message: "failed to rewrite mutation payload because duplicate XID found: S1"
+
+- name: "Top Level Duplicate XIDs with different object Test"
+  gqlmutation: |
+    mutation addState($input: [AddStateInput!]!) {
+      addState(input: $input) {
+        state {
+          code
+          name
+        }
+      }
+    }
+  gqlvariables: |
+    {
+      "input": [
+        {"name": "State1", "code": "S1"},
+        {"name": "State2", "code": "S1"}
+      ]
+    }
+  explanation: "When duplicate XIDs are given as input at top level, but the object structure is
+  different, it should still return error."
+  error:
+    message: "failed to rewrite mutation payload because duplicate XID found: S1"
+
+- name: "Deep Mutation Duplicate XIDs with same object Test"
+  gqlmutation: |
+    mutation addCity($input: [AddCityInput!]!) {
+      addCity(input: $input) {
+        city {
+          name
+          district {
+            code
+            name
+          }
+        }
+      }
+    }
+  gqlvariables: |
+    {
+      "input": [
+        {
+          "name": "Bengaluru",
+          "district": {"code": "D1", "name": "Dist1"}
+        },
+        {
+          "name": "NY",
+          "district": {"code": "D1", "name": "Dist1"}
+        }
+      ]
+    }
+  explanation: "When duplicate XIDs are given as input to deep mutation but the object structure
+  is same, it should not return error."
+  dgquery: |-
+    query {
+      District3 as District3(func: eq(District.code, "D1")) @filter(type(District)) {
+        uid
+      }
+    }
+  dgmutations:
+    - setjson: |
+        {
+          "City.name":"Bengaluru",
+          "City.district":{
+              "District.code":"D1",
+              "District.cities":[{"uid":"_:City1"}],
+              "District.name":"Dist1",
+              "dgraph.type":["District"],
+              "uid":"_:District3"
+            },
+          "dgraph.type":["City"],
+          "uid":"_:City1"
+        }
+      cond: "@if(eq(len(District3), 0))"
+    - setjson: |
+        {
+          "City.name":"Bengaluru",
+          "City.district":{
+              "District.cities":[{"uid":"_:City1"}],
+              "uid":"uid(District3)"
+            },
+          "dgraph.type":["City"],
+          "uid":"_:City1"
+        }
+      cond: "@if(eq(len(District3), 1))"
+    - setjson: |
+        {
+          "City.name":"NY",
+          "City.district":{
+              "District.cities":[{"uid":"_:City4"}],
+              "dgraph.type":["District"],
+              "uid":"_:District3"
+            },
+          "dgraph.type":["City"],
+          "uid":"_:City4"
+        }
+      cond: "@if(eq(len(District3), 0))"
+    - setjson: |
+        {
+          "City.name":"NY",
+          "City.district":{
+              "District.cities":[{"uid":"_:City4"}],
+              "uid":"uid(District3)"
+            },
+          "dgraph.type":["City"],
+          "uid":"_:City4"
+        }
+      cond: "@if(eq(len(District3), 1))"
+
+- name: "Deep Mutation Duplicate XIDs with same object with @hasInverse Test"
+  gqlmutation: |
+    mutation addCountry($input: [AddCountryInput!]!) {
+      addCountry(input: $input) {
+        country {
+          id
+          name
+          states {
+            code
+            name
+            capital
+          }
+        }
+      }
+    }
+  gqlvariables: |
+    {
+      "input": [
+        {
+          "name": "Country1",
+          "states": [
+            {"code": "S1", "name": "State1", "capital": "Cap1"},
+            {"code": "S1", "name": "State1", "capital": "Cap1"}
+          ]
+        },
+        {
+          "name": "Country2",
+          "states": [
+            {"code": "S2", "name": "State2", "capital": "Cap2"}
+          ]
+        },
+        {
+          "name": "Country3",
+          "states": [
+            {"code": "S2", "name": "State2", "capital": "Cap2"}
+          ]
+        }
+      ]
+    }
+  explanation: "When duplicate XIDs are given as input to deep mutation and the object structure
+  is same and the containing object has @hasInverse on its xid object field, but the xid object
+  does not have the @hasInverse field of List type, it should return error."
+  error:
+    message: |-
+      failed to rewrite mutation payload because duplicate XID found: S1
+      failed to rewrite mutation payload because duplicate XID found: S1
+      failed to rewrite mutation payload because duplicate XID found: S2
+
+- name: "Deep Mutation Duplicate XIDs with different object Test"
+  gqlmutation: |
+    mutation addStudent($input: [AddStudentInput!]!) {
+      addStudent(input: $input) {
+        student {
+          xid
+          name
+          taughtBy {
+            xid
+            name
+            subject
+          }
+        }
+      }
+    }
+  gqlvariables: |
+    {
+      "input": [
+        {
+          "xid": "S1",
+          "name": "Stud1",
+          "taughtBy": [
+            {"xid": "T1", "name": "Teacher1", "subject": "Sub1"}
+          ]
+        },
+        {
+          "xid": "S2",
+          "name": "Stud2",
+          "taughtBy": [
+            {"xid": "T1", "name": "Teacher1", "subject": "Sub2"}
+          ]
+        },
+        {
+          "xid": "S3",
+          "name": "Stud3",
+          "taughtBy": [
+            {"xid": "T1", "name": "Teacher1"}
+          ]
+        }
+      ]
+    }
+  explanation: "When duplicate XIDs are given as input to deep mutation but the object structure
+  is different, it should return error."
+  error:
+    message: |-
+      failed to rewrite mutation payload because duplicate XID found: T1
+      failed to rewrite mutation payload because duplicate XID found: T1
+
+- name: "Circular Duplicate XIDs in single mutation"
+  gqlmutation: |
+    mutation addStudent($input: [AddStudentInput!]!) {
+      addStudent(input: $input) {
+        student {
+          xid
+          name
+          taughtBy {
+            xid
+            name
+            subject
+          }
+        }
+      }
+    }
+  gqlvariables: |
+    {
+      "input": [
+        {
+          "xid": "S1",
+          "name": "Stud1",
+          "taughtBy": [
+            {"xid": "T1", "name": "Teacher1", "teaches": [{"xid": "S1", "name": "Stud1"}]}
+          ]
+        }
+      ]
+    }
+  explanation: "When duplicate XIDs are given as input circularly in a single mutation, it
+  should return error."
+  error:
+    message: |-
+      failed to rewrite mutation payload because duplicate XID found: S1
+
+- name: "Duplicate XIDs in single mutation for Interface"
+  gqlmutation: |
+    mutation addStudent($input: [AddStudentInput!]!) {
+      addStudent(input: $input) {
+        student {
+          xid
+          name
+          taughtBy {
+            xid
+            name
+            subject
+          }
+        }
+      }
+    }
+  gqlvariables: |
+    {
+      "input": [
+        {
+          "xid": "S1",
+          "name": "Stud1"
+        },
+        {
+          "xid": "S2",
+          "name": "Stud2",
+          "taughtBy": [
+            {"xid": "S1", "name": "Teacher1", "subject": "Sub1"}
+          ]
+        }
+      ]
+    }
+  explanation: "When duplicate XIDs are given as input for an Interface in a single mutation, it
+  should return error."
+  error:
+    message: |-
+      failed to rewrite mutation payload because duplicate XID found: S1
+
+# Additional Deletes
+#
+# If we have
+# 
+# type Post { ... author: Author @hasInverse(field: posts) ... }
+# type Author { ... posts: [Post] ... }
+#
+# and existing edge
+# 
+# Post1 --- author --> Author1
+# 
+# there must also exist edge
+# 
+# Author1 --- posts --> Post1
+#
+# So if we did an add Author2 and connect the author to Post1, that changes the 
+# author of Post1 to Author2, we need to
+#  * add edge Post1 --- author --> Author2 (done by asIDReference/asXIDReference)
+#  * add edge Author2 --- posts --> Post1 (done by addInverseLink)
+#  * delete edge Author1 --- posts --> Post1 (done by addAdditionalDeletes)
+#
+# This delete only needs to be done when there is a singular edge in the mutation:
+# i.e. if both directions of the edge are [], then it's just an add.
+#
+# There's three cases to consider: add by ID, add by XID, deep add
+
+- name: "Additional Deletes - Add connects to existing node by ID"
+  gqlmutation: |
+    mutation addAuthor($auth: AddAuthorInput!) {
+      addAuthor(input: [$auth]) {
+        author {
+          id
+        }
+      }
+    }
+  gqlvariables: |
+    { 
+      "auth": {
+        "name": "A.N. Author",
+        "posts": [ { "postID": "0x456" } ]
+      }
+    }
+  dgmutations:
+    - setjson: |
+        { 
+          "uid":"_:Author1",
+          "dgraph.type":["Author"],
+          "Author.name":"A.N. Author",
+          "Author.posts": [
+            {
+              "uid": "0x456",
+              "Post.author": { "uid": "_:Author1" }
+            }
+          ]
+        }
+      deletejson: |
+        [
+          {
+            "uid": "uid(Author3)",
+            "Author.posts": [ { "uid": "uid(Post2)" } ]
+          }
+        ]
+      cond: "@if(eq(len(Post2), 1))"
+  dgquery: |-
+    query {
+      Post2 as Post2(func: uid(0x456)) @filter(type(Post)) {
+        uid
+      }
+      var(func: uid(Post2)) {
+        Author3 as Post.author
+      }
+    }
+
+- name: "Additional Deletes - Add connects to existing node by XID"
+  gqlmutation: |
+    mutation addCountry($inp: AddCountryInput!) {
+      addCountry(input: [$inp]) {
+        country {
+          id
+        }
+      }
+    }
+  gqlvariables: |
+    { 
+      "inp": { 
+        "name": "A Country",
+        "states": [ { "code": "abc", "name": "Alphabet" } ]
+      }
+    }
+  dgmutations:
+    - setjson: |
+        { 
+          "uid" : "_:Country1",
+          "dgraph.type": ["Country"],
+          "Country.name": "A Country",
+          "Country.states": [
+            {
+              "uid": "_:State3",
+              "dgraph.type": ["State"],
+              "State.code": "abc",
+              "State.name": "Alphabet",
+              "State.country": { "uid": "_:Country1" }
+            }
+          ]
+        }
+      cond: "@if(eq(len(State3), 0))"
+    - setjson: |
+        { 
+          "uid" : "_:Country1",
+          "dgraph.type": ["Country"],
+          "Country.name": "A Country",
+          "Country.states": [
+            {
+              "uid": "uid(State3)",
+              "State.country": { "uid": "_:Country1" }
+            }
+          ]
+        }
+      deletejson: |
+        [
+          {
+            "uid": "uid(Country4)",
+            "Country.states": [ { "uid": "uid(State3)" } ]
+          }
+        ]
+      cond: "@if(eq(len(State3), 1))"
+  dgquery: |-
+    query {
+      State3 as State3(func: eq(State.code, "abc")) @filter(type(State)) {
+        uid
+      }
+      var(func: uid(State3)) {
+        Country4 as State.country
+      }
+    }
+
+- name: "Additional Deletes - deep mutation"
+  gqlmutation: |
+    mutation addAuthor($auth: AddAuthorInput!) {
+      addAuthor(input: [$auth]) {
+        author {
+          id
+        }
+      }
+    }
+  gqlvariables: |
+    { 
+      "auth": {
+        "name": "A.N. Author",
+        "country": { 
+          "name": "A Country",
+          "states": [ { "code": "abc", "name": "Alphabet" } ]
+        }
+      }
+    }
+  dgmutations:
+    - setjson: |
+        { 
+          "uid":"_:Author1",
+          "dgraph.type":["Author"],
+          "Author.name":"A.N. Author",
+          "Author.country": {
+            "uid": "_:Country2",
+            "dgraph.type": ["Country"],
+            "Country.name": "A Country",
+            "Country.states": [
+              {
+                "uid": "_:State4",
+                "dgraph.type": ["State"],
+                "State.code": "abc",
+                "State.name": "Alphabet",
+                "State.country": { "uid": "_:Country2" }
+              }
+            ]
+          }
+        }
+      cond: "@if(eq(len(State4), 0))"
+    - setjson: |
+        { 
+          "uid":"_:Author1",
+          "dgraph.type":["Author"],
+          "Author.name":"A.N. Author",
+          "Author.country": {
+            "uid" : "_:Country2",
+            "dgraph.type": ["Country"],
+            "Country.name": "A Country",
+            "Country.states": [
+              {
+                "uid": "uid(State4)",
+                "State.country": { "uid": "_:Country2" }
+              }
+            ]
+          }
+        }
+      deletejson: |
+        [
+          {
+            "uid": "uid(Country5)",
+            "Country.states": [ { "uid": "uid(State4)" } ]
+          }
+        ]
+      cond: "@if(eq(len(State4), 1))"
+  dgquery: |-
+    query {
+      State4 as State4(func: eq(State.code, "abc")) @filter(type(State)) {
+        uid
+      }
+      var(func: uid(State4)) {
+        Country5 as State.country
+      }
+    }

@@ -34,6 +34,7 @@ import (
 	"github.com/dgraph-io/badger/v2/y"
 
 	"github.com/dgraph-io/dgraph/chunker"
+	"github.com/dgraph-io/dgraph/ee/enc"
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/schema"
 	"github.com/dgraph-io/dgraph/x"
@@ -49,7 +50,6 @@ type options struct {
 	OutDir           string
 	ReplaceOutDir    bool
 	TmpDir           string
-	BadgerKeyFile    string // used only in enterprise build. nil otherwise.
 	NumGoroutines    int
 	MapBufSize       uint64
 	SkipMapPhase     bool
@@ -62,11 +62,19 @@ type options struct {
 	IgnoreErrors     bool
 	CustomTokenizers string
 	NewUids          bool
+	ClientDir        string
+	Encrypted        bool
 
 	MapShards    int
 	ReduceShards int
 
 	shardOutputDirs []string
+
+	// ........... Badger options ..........
+	// EncryptionKey is the key used for encryption. Enterprise only feature.
+	EncryptionKey x.SensitiveByteSlice
+	// BadgerCompressionlevel is the compression level to use while writing to badger.
+	BadgerCompressionLevel int
 }
 
 type state struct {
@@ -109,7 +117,7 @@ func newLoader(opt *options) *loader {
 		readerChunkCh: make(chan *bytes.Buffer, opt.NumGoroutines),
 		writeTs:       getWriteTimestamp(zero),
 	}
-	st.schema = newSchemaStore(readSchema(opt.SchemaFile), opt, st)
+	st.schema = newSchemaStore(readSchema(opt), opt, st)
 	ld := &loader{
 		state:   st,
 		mappers: make([]*mapper, opt.NumGoroutines),
@@ -136,13 +144,19 @@ func getWriteTimestamp(zero *grpc.ClientConn) uint64 {
 	}
 }
 
-func readSchema(filename string) *schema.ParsedSchema {
-	f, err := os.Open(filename)
+func readSchema(opt *options) *schema.ParsedSchema {
+	f, err := os.Open(opt.SchemaFile)
 	x.Check(err)
 	defer f.Close()
-	var r io.Reader = f
-	if filepath.Ext(filename) == ".gz" {
-		r, err = gzip.NewReader(f)
+
+	key := opt.EncryptionKey
+	if !opt.Encrypted {
+		key = nil
+	}
+	r, err := enc.GetReader(key, f)
+	x.Check(err)
+	if filepath.Ext(opt.SchemaFile) == ".gz" {
+		r, err = gzip.NewReader(r)
 		x.Check(err)
 	}
 
@@ -156,7 +170,15 @@ func readSchema(filename string) *schema.ParsedSchema {
 
 func (ld *loader) mapStage() {
 	ld.prog.setPhase(mapPhase)
-	ld.xids = xidmap.New(ld.zero, nil)
+	var db *badger.DB
+	if len(ld.opt.ClientDir) > 0 {
+		x.Check(os.MkdirAll(ld.opt.ClientDir, 0700))
+
+		var err error
+		db, err = badger.Open(badger.DefaultOptions(ld.opt.ClientDir))
+		x.Checkf(err, "Error while creating badger KV posting store")
+	}
+	ld.xids = xidmap.New(ld.zero, db)
 
 	files := x.FindDataFiles(ld.opt.DataFiles, []string{".rdf", ".rdf.gz", ".json", ".json.gz"})
 	if len(files) == 0 {
@@ -192,7 +214,11 @@ func (ld *loader) mapStage() {
 		go func(file string) {
 			defer thr.Done(nil)
 
-			r, cleanup := chunker.FileReader(file)
+			key := ld.opt.EncryptionKey
+			if !ld.opt.Encrypted {
+				key = nil
+			}
+			r, cleanup := chunker.FileReader(file, key)
 			defer cleanup()
 
 			chunk := chunker.NewChunker(loadType, 1000)
@@ -219,13 +245,19 @@ func (ld *loader) mapStage() {
 		ld.mappers[i] = nil
 	}
 	x.Check(ld.xids.Flush())
+	if db != nil {
+		x.Check(db.Close())
+	}
 	ld.xids = nil
 }
 
 func (ld *loader) reduceStage() {
 	ld.prog.setPhase(reducePhase)
 
-	r := reducer{state: ld.state}
+	r := reducer{
+		state:     ld.state,
+		streamIds: make(map[string]uint32),
+	}
 	x.Check(r.run())
 }
 

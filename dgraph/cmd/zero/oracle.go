@@ -17,19 +17,19 @@
 package zero
 
 import (
+	"context"
 	"math/rand"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/dgraph-io/badger/v2/y"
-	"github.com/dgraph-io/dgo/v2/protos/api"
+	"github.com/dgraph-io/dgo/v200/protos/api"
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/x"
 	"github.com/golang/glog"
 	"github.com/pkg/errors"
 	otrace "go.opencensus.io/trace"
-	"golang.org/x/net/context"
 )
 
 type syncMark struct {
@@ -61,7 +61,7 @@ func (o *Oracle) Init() {
 	o.keyCommit = make(map[string]uint64)
 	o.subscribers = make(map[int]chan pb.OracleDelta)
 	o.updates = make(chan *pb.OracleDelta, 100000) // Keeping 1 second worth of updates.
-	o.doneUntil.Init(nil, true)
+	o.doneUntil.Init(nil)
 	go o.sendDeltasToSubscribers()
 }
 

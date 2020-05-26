@@ -22,7 +22,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dgraph-io/dgo/v2/protos/api"
+	"github.com/dgraph-io/dgo/v200/protos/api"
 	"github.com/stretchr/testify/require"
 )
 
@@ -102,9 +102,9 @@ func TestFacets(t *testing.T) {
 		"q":[
 			{
 				"boss":{
-					"name":"Alice"
-				},
-				"boss|since":"2017-04-26T00:00:00Z"
+					"name":"Alice",
+					"boss|since":"2017-04-26T00:00:00Z"
+				}
 			}
 		]
 	}
@@ -122,12 +122,10 @@ func TestFacets(t *testing.T) {
 			{
 				"~boss":[
 					{
-						"name":"Bob"
+						"name":"Bob",
+						"~boss|since": "2017-04-26T00:00:00Z"
 					}
-				],
-				"~boss|since":{
-					"0":"2017-04-26T00:00:00Z"
-				}
+				]
 			}
 		]
 	}
