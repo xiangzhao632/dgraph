@@ -27,6 +27,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -47,6 +48,7 @@ type options struct {
 	DataFiles        string
 	DataFormat       string
 	SchemaFile       string
+	GqlSchemaFile    string
 	OutDir           string
 	ReplaceOutDir    bool
 	TmpDir           string
@@ -67,7 +69,6 @@ type options struct {
 
 	MapShards    int
 	ReduceShards int
-	XidShards    int
 
 	shardOutputDirs []string
 
@@ -179,7 +180,7 @@ func (ld *loader) mapStage() {
 		db, err = badger.Open(badger.DefaultOptions(ld.opt.ClientDir))
 		x.Checkf(err, "Error while creating badger KV posting store")
 	}
-	ld.xids = xidmap.New(ld.zero, db, ld.opt.XidShards, false)
+	ld.xids = xidmap.New(ld.zero, db)
 
 	files := x.FindDataFiles(ld.opt.DataFiles, []string{".rdf", ".rdf.gz", ".json", ".json.gz"})
 	if len(files) == 0 {
@@ -238,6 +239,9 @@ func (ld *loader) mapStage() {
 	}
 	x.Check(thr.Finish())
 
+	// Send the graphql triples
+	ld.processGqlSchema(loadType)
+
 	close(ld.readerChunkCh)
 	mapperWg.Wait()
 
@@ -250,6 +254,51 @@ func (ld *loader) mapStage() {
 		x.Check(db.Close())
 	}
 	ld.xids = nil
+}
+
+func (ld *loader) processGqlSchema(loadType chunker.InputFormat) {
+	if ld.opt.GqlSchemaFile == "" {
+		return
+	}
+
+	f, err := os.Open(ld.opt.GqlSchemaFile)
+	x.Check(err)
+	defer f.Close()
+
+	key := ld.opt.EncryptionKey
+	if !ld.opt.Encrypted {
+		key = nil
+	}
+	r, err := enc.GetReader(key, f)
+	x.Check(err)
+	if filepath.Ext(ld.opt.GqlSchemaFile) == ".gz" {
+		r, err = gzip.NewReader(r)
+		x.Check(err)
+	}
+
+	buf, err := ioutil.ReadAll(r)
+	x.Check(err)
+
+	rdfSchema := `_:gqlschema <dgraph.type> "dgraph.graphql" .
+	_:gqlschema <dgraph.graphql.xid> "dgraph.graphql.schema" .
+	_:gqlschema <dgraph.graphql.schema> %s .
+	`
+
+	jsonSchema := `{
+		"dgraph.type": "dgraph.graphql",
+		"dgraph.graphql.xid": "dgraph.graphql.schema",
+		"dgraph.graphql.schema": %s
+	}`
+
+	gqlBuf := &bytes.Buffer{}
+	schema := strconv.Quote(string(buf))
+	switch loadType {
+	case chunker.RdfFormat:
+		x.Check2(gqlBuf.Write([]byte(fmt.Sprintf(rdfSchema, schema))))
+	case chunker.JsonFormat:
+		x.Check2(gqlBuf.Write([]byte(fmt.Sprintf(jsonSchema, schema))))
+	}
+	ld.readerChunkCh <- gqlBuf
 }
 
 func (ld *loader) reduceStage() {

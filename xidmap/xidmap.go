@@ -41,8 +41,7 @@ type XidMap struct {
 	newRanges  chan *pb.AssignedIds
 	zc         pb.ZeroClient
 	maxUidSeen uint64
-	//uid ranges that assign once
-	chunk uint64
+
 	// Optionally, these can be set to persist the mappings.
 	writer *badger.WriteBatch
 }
@@ -73,7 +72,7 @@ func (b *block) assign(ch <-chan *pb.AssignedIds) uint64 {
 // New creates an XidMap. zero conn must be valid for UID allocations to happen. Optionally, a
 // badger.DB can be provided to persist the xid to uid allocations. This would add latency to the
 // assignment operations.
-func New(zero *grpc.ClientConn, db *badger.DB, xidShard int, fast bool) *XidMap {
+func New(zero *grpc.ClientConn, db *badger.DB) *XidMap {
 	numShards := 32
 	xm := &XidMap{
 		newRanges: make(chan *pb.AssignedIds, numShards),
@@ -114,11 +113,6 @@ func New(zero *grpc.ClientConn, db *badger.DB, xidShard int, fast bool) *XidMap 
 		})
 		x.Check(err)
 	}
-	if fast {
-		xm.chunk = 1e5
-	} else {
-		xm.chunk = 1e4
-	}
 	xm.zc = pb.NewZeroClient(zero)
 
 	go func() {
@@ -127,7 +121,7 @@ func New(zero *grpc.ClientConn, db *badger.DB, xidShard int, fast bool) *XidMap 
 		backoff := initBackoff
 		for {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-			assigned, err := xm.zc.AssignUids(ctx, &pb.Num{Val: xm.chunk})
+			assigned, err := xm.zc.AssignUids(ctx, &pb.Num{Val: 1e4})
 			glog.V(1).Infof("Assigned Uids: %+v. Err: %v", assigned, err)
 			cancel()
 			if err == nil {

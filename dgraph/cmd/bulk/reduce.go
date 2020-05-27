@@ -56,9 +56,6 @@ type reducer struct {
 	streamIds map[string]uint32
 }
 
-const batchSize = 10000
-const batchAlloc = batchSize * 11 / 10
-
 func (r *reducer) run() error {
 	dirs := readShardDirs(filepath.Join(r.opt.TmpDir, reduceShardDir))
 	x.AssertTrue(len(dirs) == r.opt.ReduceShards)
@@ -265,7 +262,6 @@ func (r *reducer) encodeAndWrite(writer *badger.StreamWriter, entryCh chan []*pb
 
 func (r *reducer) reduce(mapItrs []*mapIterator, ci *countIndexer) {
 	entryCh := make(chan []*pb.MapEntry, 100)
-
 	closer := y.NewCloser(1)
 	defer closer.SignalAndWait()
 
