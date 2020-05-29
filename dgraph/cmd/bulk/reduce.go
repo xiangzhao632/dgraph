@@ -27,7 +27,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"sync"
 	"sync/atomic"
 
 	"github.com/dgraph-io/badger/v2"
@@ -52,7 +51,6 @@ type kvBuilder struct {
 type reducer struct {
 	*state
 	streamId  uint32
-	mu        sync.RWMutex
 	streamIds map[string]uint32
 }
 
@@ -177,14 +175,6 @@ func newMapIterator(filename string) *mapIterator {
 }
 
 func (r *reducer) streamIdFor(pred string) uint32 {
-	r.mu.RLock()
-	if id, ok := r.streamIds[pred]; ok {
-		r.mu.RUnlock()
-		return id
-	}
-	r.mu.RUnlock()
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	if id, ok := r.streamIds[pred]; ok {
 		return id
 	}
@@ -198,8 +188,6 @@ func (r *reducer) encodeAndWrite(writer *badger.StreamWriter, entryCh chan []*pb
 
 	var listSize int
 	list := &bpb.KVList{}
-	//Since a batch doesn't always include all mapEntries with the same key. kvBuilder is needed
-	//to save in building kv.
 	kvb := &kvBuilder{
 		currentKey: nil,
 		uids:       nil,
@@ -213,14 +201,15 @@ func (r *reducer) encodeAndWrite(writer *badger.StreamWriter, entryCh chan []*pb
 	// number of streams.
 	// This change limits maximum number of open streams to number of streams created in a single
 	// write call. This can also be optimised if required.
-	addDone := func(doneSteams map[uint32]struct{}, l *bpb.KVList) {
-		for streamId := range doneSteams {
+	addDone := func(doneSteams []uint32, l *bpb.KVList) {
+		for _, streamId := range doneSteams {
 			l.Kv = append(l.Kv, &bpb.KV{StreamId: streamId, StreamDone: true})
 		}
 	}
 
-	doneStreams := map[uint32]struct{}{}
-	var prevPred string
+	var doneStreams []uint32
+	var prevSID uint32
+	var hasStartUid bool
 	for batch := range entryCh {
 		listSize += r.toList(batch, list, kvb)
 		if listSize > 4<<20 {
@@ -228,18 +217,23 @@ func (r *reducer) encodeAndWrite(writer *badger.StreamWriter, entryCh chan []*pb
 				pk, err := x.Parse(kv.Key)
 				x.Check(err)
 				x.AssertTrue(len(pk.Attr) > 0)
-				if prevPred != "" && (prevPred != pk.Attr) {
-					addDone(doneStreams, list)
-					doneStreams = map[uint32]struct{}{}
-				}
-				prevPred = pk.Attr
 				kv.StreamId = r.streamIdFor(pk.Attr)
+				if prevSID != 0 && (prevSID != kv.StreamId) {
+					doneStreams = append(doneStreams, prevSID)
+					if hasStartUid {
+						doneStreams = append(doneStreams, prevSID|0x80000000)
+						hasStartUid = false
+					}
+				}
+				prevSID = kv.StreamId
 				if pk.HasStartUid {
 					kv.StreamId |= 0x80000000
+					hasStartUid = true
 				}
-				doneStreams[kv.StreamId] = struct{}{}
 			}
+			addDone(doneStreams, list)
 			x.Check(writer.Write(list))
+			doneStreams = doneStreams[:0]
 			list = &bpb.KVList{}
 			listSize = 0
 		}
@@ -303,9 +297,6 @@ func (r *reducer) reduce(mapItrs []*mapIterator, ci *countIndexer) {
 			plistLen = 0
 		}
 
-		//Don't wait keyChanged became true. Sometimes, key doesn't change for a long time.
-		//That causes a very large batch size, therefore the memory usage will grow rapaidly.
-		//And the process will delay for a long time, therefore slow down average speed.
 		if len(batch) >= batchSize {
 			entryCh <- batch
 			batch = make([]*pb.MapEntry, 0, batchAlloc)
@@ -355,10 +346,6 @@ func (h *postingHeap) Pop() interface{} {
 }
 
 func (r *reducer) toList(mapEntries []*pb.MapEntry, list *bpb.KVList, kvb *kvBuilder) int {
-	//kvBuilder replaces these vars.
-	//var currentKey []byte
-	//var uids []uint64
-	//pl := new(pb.PostingList)
 	var size int
 
 	appendToList := func() {
@@ -396,6 +383,9 @@ func (r *reducer) toList(mapEntries []*pb.MapEntry, list *bpb.KVList, kvb *kvBui
 			l := posting.NewList(y.Copy(kvb.currentKey), kvb.pl, r.state.writeTs)
 			kvs, err := l.Rollup()
 			x.Check(err)
+			for _, kv := range kvs {
+				size += kv.Size()
+			}
 			list.Kv = append(list.Kv, kvs...)
 		} else {
 			val, err := kvb.pl.Marshal()
