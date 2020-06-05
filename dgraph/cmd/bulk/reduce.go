@@ -50,8 +50,7 @@ type kvBuilder struct {
 
 type reducer struct {
 	*state
-	streamId  uint32
-	streamIds map[string]uint32
+	streamId uint32
 }
 
 func (r *reducer) run() error {
@@ -174,15 +173,6 @@ func newMapIterator(filename string) *mapIterator {
 	return &mapIterator{fd: fd, reader: bufio.NewReaderSize(gzReader, 16<<10)}
 }
 
-func (r *reducer) streamIdFor(pred string) uint32 {
-	if id, ok := r.streamIds[pred]; ok {
-		return id
-	}
-	streamId := atomic.AddUint32(&r.streamId, 1)
-	r.streamIds[pred] = streamId
-	return streamId
-}
-
 func (r *reducer) encodeAndWrite(writer *badger.StreamWriter, entryCh chan []*pb.MapEntry, closer *y.Closer) {
 	defer closer.Done()
 
@@ -193,6 +183,16 @@ func (r *reducer) encodeAndWrite(writer *badger.StreamWriter, entryCh chan []*pb
 		uids:       nil,
 		pl:         new(pb.PostingList),
 		finish:     false,
+	}
+
+	streamIds := make(map[string]uint32)
+	streamIdFor := func(pred string) uint32 {
+		if id, ok := streamIds[pred]; ok {
+			return id
+		}
+		streamId := atomic.AddUint32(&r.streamId, 1)
+		streamIds[pred] = streamId
+		return streamId
 	}
 
 	// Once we have processed all records from single stream, we can mark that stream as done.
@@ -217,7 +217,7 @@ func (r *reducer) encodeAndWrite(writer *badger.StreamWriter, entryCh chan []*pb
 				pk, err := x.Parse(kv.Key)
 				x.Check(err)
 				x.AssertTrue(len(pk.Attr) > 0)
-				kv.StreamId = r.streamIdFor(pk.Attr)
+				kv.StreamId = streamIdFor(pk.Attr)
 				if prevSID != 0 && (prevSID != kv.StreamId) {
 					doneStreams = append(doneStreams, prevSID)
 					if hasStartUid {
@@ -245,7 +245,7 @@ func (r *reducer) encodeAndWrite(writer *badger.StreamWriter, entryCh chan []*pb
 			pk, err := x.Parse(kv.Key)
 			x.Check(err)
 			x.AssertTrue(len(pk.Attr) > 0)
-			kv.StreamId = r.streamIdFor(pk.Attr)
+			kv.StreamId = streamIdFor(pk.Attr)
 			if pk.HasStartUid {
 				kv.StreamId |= 0x80000000
 			}
